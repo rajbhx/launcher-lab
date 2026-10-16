@@ -103,9 +103,11 @@ pub struct LauncherLab {
     pub theme_dark: bool,
     pub toast: Option<(String, f32)>,
     pub time: clock::TimeParts,
+    /// Monotonic input time (seconds) of the current frame.
+    now: f64,
     /// Hit rectangles rebuilt during painting, in paint (z) order.
     pub hits: Vec<(Rect, Hit)>,
-    unlock_hold: f32,
+    pub unlock_hold: f32,
     press: Option<PressInfo>,
     active: Option<ActiveGesture>,
     last_pos: Pos2,
@@ -187,6 +189,7 @@ impl LauncherLab {
             theme_dark: true,
             toast: Some(("Hold empty home: light/dark chrome".into(), 2.6)),
             time: clock::now(),
+            now: 0.0,
             hits: Vec::new(),
             unlock_hold: 0.0,
             press: None,
@@ -821,7 +824,7 @@ impl LauncherLab {
 
         // Long-press (0.65 s) on the latching targets.
         if let Some(pr) = &self.press {
-            if !pr.consumed && self.time - pr.t > 0.65 {
+            if !pr.consumed && self.now - pr.t > 0.65 {
                 let card = pr.card.clone();
                 let hidden_item = pr.hidden_item.clone();
                 let menu = pr.menu;
@@ -865,6 +868,7 @@ impl eframe::App for LauncherLab {
         let released = ctx.input(|i| i.pointer.any_released());
         let down = ctx.input(|i| i.pointer.any_down());
         let dt = ctx.input(|i| i.stable_dt).min(0.1);
+        self.now = time;
 
         if pressed {
             self.begin(pos, time, screen);

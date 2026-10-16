@@ -437,14 +437,14 @@ fn google(p: &Painter, c: Pos2, r: f32) {
     google_g(p, c, r * 0.55, r * 0.28, r * 0.52);
 }
 
-fn google_g(p: &Painter, c: Pos2, rr: f32, w: f32, bar: f32) {
-    arc(p, c, rr, w, 205.0, 310.0, theme::rgb(0xEA4335));
-    arc(p, c, rr, w, 135.0, 205.0, theme::rgb(0xFBBC05));
-    arc(p, c, rr, w, 55.0, 135.0, theme::rgb(0x34A853));
-    arc(p, c, rr, w, -35.0, 55.0, theme::rgb(0x4285F4));
+fn google_g(p: &Painter, c: Pos2, rad: f32, w: f32, bar: f32) {
+    arc(p, c, rad, w, 205.0, 310.0, theme::rgb(0xEA4335));
+    arc(p, c, rad, w, 135.0, 205.0, theme::rgb(0xFBBC05));
+    arc(p, c, rad, w, 55.0, 135.0, theme::rgb(0x34A853));
+    arc(p, c, rad, w, -35.0, 55.0, theme::rgb(0x4285F4));
     rr(
         p,
-        c + vec2(bar * 0.5, 0.16 * rr + w * 0.2),
+        c + vec2(bar * 0.5, 0.16 * rad + w * 0.2),
         bar,
         w * 0.97,
         w * 0.15,
