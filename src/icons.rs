@@ -11,7 +11,7 @@ use eframe::egui::{pos2, vec2, Align2, Color32, CornerRadius, Painter, Pos2, Rec
 
 use crate::theme;
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum App {
     Phone,
     Messages,
