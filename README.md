@@ -35,25 +35,37 @@ against the Android NDK (r26d); nothing is compiled on a local machine.
 
 ## What it does
 
-Everything in the app is one of the reconstructed subsystems, made tangible:
+The home screen reconstructs the stock OxygenOS 10 look from the decoded resources
+(`default_workspace_5x5_7.xml`, `dimens.xml`, `device_profiles.xml`): icons, the
+clock/weather widget with the signature red leading digit, the Google pill, the dock, and the
+`^` caret + page dots are all drawn live with `egui` primitives — no image assets ship with
+the app.
 
-| Gesture / UI element | Reconstructed subsystem (see `docs/ANALYSIS.md`) |
+| Gesture / UI element | Behaviour (reconstructed from) |
 | --- | --- |
-| Swipe up from the bottom edge → **Recents/Overview** rises; swipe down → back home | `OverviewInputConsumer` / `ResetGestureInputConsumer`, the `TYPE_OVERVIEW` / `TYPE_RESET_GESTURE` state space of `net.oneplus.quickstep.TouchInteractionService` |
-| Start a touch in the **bottom-left corner** → assistant bubble | `AssistantTouchConsumer` |
-| **LOCK** chip → all gestures stop routing, overlay says so; tap to unlock | `DeviceLockedInputConsumer` |
-| Swipe from the **left edge** → **Shelf** panel slides over the home grid | edge-swipe shelf surface |
-| Shelf shows **channel cards** (`weather.home`, `health.steps`, `music.now`, `memo.*`) | `CardProvider` / `CardContract` binder API: register channel, `postCard(channel, tag)` |
-| **+ MEMO** posts a card; posting the same `(channel, tag)` updates it | `PostCardResult::Posted` / `Updated` semantics |
-| Tap a memo → `getCard` readout; **hold** a memo → `deleteCard` | `getCard` / `deleteCard` by `(channel, tag)` |
-| **Pinch out** on home → **Hidden Space**; pinch in to leave | Hidden Space entry gesture |
-| Hidden Space **password** toggle + hold-to-unlock pad | `HiddenSpaceModel` password flag gating access |
-| Drag a recents card sideways / tap to resume | recents task lifecycle in the overview |
-| Live HUD pill at the top while you drag | shows which consumer class the gesture routed to |
+| Swipe left / right on home | 5-page pager (`default_workspace_5x5_7.xml` page layout) |
+| Swipe right from the **left edge**, or right-drag on page 1 | **Shelf** slides in from the left |
+| Swipe **up** in the middle of home | App **drawer** (all-apps grid, alphabetical) |
+| Swipe **up from the bottom edge** | **Recents** (Overview) — `OverviewInputConsumer` |
+| Swipe **down** in recents / drawer | Back home — `ResetGestureInputConsumer` |
+| Tap the **^** caret above the page dots | Open the drawer; dots jump pages |
+| Bottom-left corner touch | Assistant zone (`AssistantTouchConsumer`) |
+| Drawer: swipe **right** | **Hidden Space**; swipe down closes; drag scrolls the grid |
+| Hidden Space: hold the ring | Unlock; hold the ⋮ menu glyph to toggle the password flag (`HiddenSpaceModel`) |
+| Hidden items: hold an icon | Unhide (`unhideItem`); tap = open demo |
+| Recents: swipe up on a card | Dismiss the task; drag across = carousel; Clear all empties it |
+| Shelf: tap a card | `getCard` readout; hold a memo → `deleteCard`; "+ New note" → `postCard` |
+| Hold empty home | Light/dark chrome toggle (dark pill ↔ light pill) |
+| Double-tap empty home | Device-locked overlay (`DeviceLockedInputConsumer`); tap to unlock |
+
+The shelf's Toolbox / Recent apps / Parking Location cards mirror the stock 4.4.8 shelf,
+followed by live cards from the reconstructed `CardProvider` channel store
+(`weather.home`, `health.steps`, `music.now`, `memo.*`).
 
 Unit tests cover the pure model: gesture classification & release outcomes
 (`src/model/state.rs`), pager physics (`src/model/pager.rs`), the card contract
-(`src/model/shelf.rs`), and the hidden-space flag model (`src/model/hidden.rs`).
+(`src/model/shelf.rs`), the hidden-space flag model (`src/model/hidden.rs`), and the
+UTC civil-date clock math (`src/clock.rs`).
 
 ## Architecture
 
@@ -63,18 +75,23 @@ src/
 ├── main.rs       desktop binary (`cargo run`)
 ├── android.rs    Android entry (`android_main`, NativeActivity)
 ├── app.rs        state, input routing, gesture lifecycle
-├── views.rs      painter-only rendering (every control hand-drawn) + hit zones
-├── theme.rs      palette + animation helpers
+├── views.rs      painter-only rendering of every surface + hit zones
+├── icons.rs      every app icon, composed from primitives
+├── wallpaper.rs  procedural wallpaper (painterly clouds over indigo)
+├── clock.rs      wall-clock time (`localtime_r` on Android, UTC civil-date on host)
+├── theme.rs      palette + bundled Roboto families + animation helpers
 └── model/        pure logic, unit-tested
     ├── state.rs  input-consumer routing (the reconstructed state machine)
     ├── pager.rs  home-screen pager
     ├── shelf.rs  CardContract-style store
     └── hidden.rs Hidden Space model
+assets/
+└── fonts/        Roboto Regular/Light/Medium (Apache-2.0, see LICENSE.txt)
 ```
 
 Rendering is `egui`/`eframe` (GLES via glow). The UI is 100% custom-painted: rounded tiles,
-task cards, shelf, unlock ring — no widgets, no assets. Frame-rate independent exponential
-animations keep transitions smooth.
+task cards, shelf, unlock ring, wallpaper — no widgets, no bitmaps. Frame-rate independent
+exponential animations keep transitions smooth.
 
 ## How it's built (GitHub Actions)
 

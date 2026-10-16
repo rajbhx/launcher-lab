@@ -56,6 +56,8 @@ impl ConsumerType {
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Screen {
     Home,
+    /// App drawer (all-apps list) — the original `AllAppsContainerView`.
+    Drawer,
     Overview,
     Hidden,
 }
@@ -100,6 +102,10 @@ pub enum ReleaseOutcome {
     OpenShelf,
     NextPage,
     PrevPage,
+    /// Swipe up in the middle of home: open the app drawer.
+    OpenDrawer,
+    /// Swipe right in the drawer: slide over to the Hidden Space.
+    OpenHidden,
 }
 
 /// Decide which consumer a touch-down routes to, based on the current screen
@@ -141,6 +147,7 @@ pub fn classify_start(
             }
         }
         Screen::Hidden => (ConsumerType::NoOp, GestureOrigin::Center),
+        Screen::Drawer => (ConsumerType::NoOp, GestureOrigin::Center),
     }
 }
 
@@ -172,10 +179,21 @@ pub fn classify_release(
             }
         }
         (Screen::Home, ConsumerType::Pager) => {
-            if dx > w * 0.25 || vx > 600.0 {
+            if -dy > h * 0.12 || -vy > 700.0 {
+                ReleaseOutcome::OpenDrawer
+            } else if dx > w * 0.25 || vx > 600.0 {
                 ReleaseOutcome::PrevPage
             } else if -dx > w * 0.25 || -vx > 600.0 {
                 ReleaseOutcome::NextPage
+            } else {
+                ReleaseOutcome::Stay
+            }
+        }
+        (Screen::Drawer, ConsumerType::NoOp) => {
+            if dx > w * 0.16 || vx > 500.0 {
+                ReleaseOutcome::OpenHidden
+            } else if dy > h * 0.10 || vy > 550.0 {
+                ReleaseOutcome::GoHome
             } else {
                 ReleaseOutcome::Stay
             }
@@ -365,5 +383,57 @@ mod tests {
             H,
         );
         assert_eq!(stay, ReleaseOutcome::Stay);
+    }
+
+    #[test]
+    fn drawer_zone_is_noop() {
+        let (c, o) = classify_start(Screen::Drawer, false, 500.0, 400.0, W, H, z());
+        assert_eq!(c, ConsumerType::NoOp);
+        assert_eq!(o, GestureOrigin::Center);
+    }
+
+    #[test]
+    fn home_swipe_up_opens_drawer() {
+        let out = classify_release(
+            ConsumerType::Pager,
+            Screen::Home,
+            0.0,
+            -250.0,
+            0.0,
+            -800.0,
+            W,
+            H,
+        );
+        assert_eq!(out, ReleaseOutcome::OpenDrawer);
+    }
+
+    #[test]
+    fn drawer_swipe_right_opens_hidden_space() {
+        let out = classify_release(
+            ConsumerType::NoOp,
+            Screen::Drawer,
+            250.0,
+            10.0,
+            600.0,
+            0.0,
+            W,
+            H,
+        );
+        assert_eq!(out, ReleaseOutcome::OpenHidden);
+    }
+
+    #[test]
+    fn drawer_swipe_down_closes() {
+        let out = classify_release(
+            ConsumerType::NoOp,
+            Screen::Drawer,
+            0.0,
+            300.0,
+            0.0,
+            700.0,
+            W,
+            H,
+        );
+        assert_eq!(out, ReleaseOutcome::GoHome);
     }
 }

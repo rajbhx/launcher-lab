@@ -13,8 +13,11 @@
 pub mod model;
 
 mod app;
+mod clock;
+mod icons;
 mod theme;
 mod views;
+mod wallpaper;
 
 #[cfg(target_os = "android")]
 mod android;
