@@ -25,13 +25,18 @@ jobs:
           distribution: temurin
           java-version: 17
 
-      - name: Set up Android SDK
-        uses: android-actions/setup-android@v3
-
       - name: Install SDK packages
+        # The ubuntu runner image already ships a full Android SDK
+        # (ANDROID_HOME=/usr/local/lib/android/sdk). We only add what we need.
         # build-tools 33.0.2 is the newest release that still ships the
         # legacy `aapt` binary that cargo-apk 0.10 drives.
-        run: sdkmanager --install "platform-tools" "platforms;android-34" "build-tools;33.0.2"
+        run: |
+          set -e
+          echo "ANDROID_HOME=$ANDROID_HOME"
+          SDKMANAGER=$(ls "$ANDROID_HOME"/cmdline-tools/*/bin/sdkmanager | head -n 1)
+          echo "using $SDKMANAGER"
+          yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
+          "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;33.0.2"
 
       - name: Set up NDK r26d
         id: ndk
