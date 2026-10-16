@@ -33,6 +33,8 @@ pub fn run_desktop() -> Result<(), eframe::Error> {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_title("Launcher Lab")
             .with_inner_size([412.0, 892.0]),
+        renderer: eframe::Renderer::Glow,
+        vsync: true,
         ..Default::default()
     };
     eframe::run_native(

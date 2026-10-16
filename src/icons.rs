@@ -674,3 +674,157 @@ fn backup(p: &Painter, c: Pos2, r: f32) {
     );
     line(p, u(-0.36, 0.38), u(0.36, 0.38), r * 0.12, Color32::WHITE);
 }
+
+// --------------------------------------------------------------- ui glyphs
+
+/// Chevron-left (back).
+pub fn glyph_back(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    pline(
+        p,
+        &[
+            pos2(c.x + s * 0.30, c.y - s * 0.50),
+            pos2(c.x - s * 0.28, c.y),
+            pos2(c.x + s * 0.30, c.y + s * 0.50),
+        ],
+        s * 0.16,
+        col,
+    );
+}
+
+/// Small chevron-right (row affordance).
+pub fn glyph_chev(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    pline(
+        p,
+        &[
+            pos2(c.x - s * 0.22, c.y - s * 0.36),
+            pos2(c.x + s * 0.18, c.y),
+            pos2(c.x - s * 0.22, c.y + s * 0.36),
+        ],
+        s * 0.13,
+        col,
+    );
+}
+
+/// Filled play triangle.
+pub fn glyph_play(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    poly(
+        p,
+        &[
+            pos2(c.x - s * 0.36, c.y - s * 0.52),
+            pos2(c.x + s * 0.54, c.y),
+            pos2(c.x - s * 0.36, c.y + s * 0.52),
+        ],
+        col,
+    );
+}
+
+/// Pause bars.
+pub fn glyph_pause(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    rr(p, c + vec2(-s * 0.24, 0.0), s * 0.26, s * 1.0, s * 0.09, col);
+    rr(p, c + vec2(s * 0.24, 0.0), s * 0.26, s * 1.0, s * 0.09, col);
+}
+
+/// Skip track (triangle + bar), mirrored when `back`.
+pub fn glyph_skip(p: &Painter, c: Pos2, s: f32, col: Color32, back: bool) {
+    let m = if back { -1.0 } else { 1.0 };
+    poly(
+        p,
+        &[
+            pos2(c.x - m * s * 0.44, c.y - s * 0.42),
+            pos2(c.x + m * s * 0.16, c.y),
+            pos2(c.x - m * s * 0.44, c.y + s * 0.42),
+        ],
+        col,
+    );
+    rr(p, c + vec2(m * s * 0.34, 0.0), s * 0.16, s * 0.9, s * 0.06, col);
+}
+
+/// Map pin (ring + tail).
+pub fn glyph_pin(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    p.circle_stroke(
+        c + vec2(0.0, -s * 0.22),
+        s * 0.34,
+        Stroke::new(s * 0.16, col),
+    );
+    line(p, c + vec2(-s * 0.26, 0.02), c + vec2(0.0, s * 0.62), s * 0.13, col);
+    line(p, c + vec2(s * 0.26, 0.02), c + vec2(0.0, s * 0.62), s * 0.13, col);
+}
+
+/// Camera shutter (ring + core).
+pub fn glyph_shutter(p: &Painter, c: Pos2, r: f32, col: Color32) {
+    p.circle_stroke(c, r, Stroke::new(r * 0.22, col));
+    disc(p, c, r * 0.55, col);
+}
+
+/// Wi-Fi arcs.
+pub fn glyph_wifi(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let b = c + vec2(0.0, s * 0.34);
+    arc(p, b, s * 0.64, s * 0.16, 205.0, 335.0, col);
+    arc(p, b, s * 0.40, s * 0.16, 205.0, 335.0, col);
+    disc(p, b, s * 0.10, col);
+}
+
+/// Bluetooth rune.
+pub fn glyph_bluetooth(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let u = |x: f32, y: f32| c + vec2(x * s, y * s);
+    line(p, u(0.0, -0.60), u(0.0, 0.60), s * 0.15, col);
+    pline(
+        p,
+        &[u(0.0, -0.60), u(0.46, -0.22), u(0.0, 0.18)],
+        s * 0.15,
+        col,
+    );
+    pline(
+        p,
+        &[u(0.0, 0.60), u(0.46, 0.22), u(0.0, -0.18)],
+        s * 0.15,
+        col,
+    );
+}
+
+/// Flashlight (head + body).
+pub fn glyph_flashlight(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let u = |x: f32, y: f32| c + vec2(x * s, y * s);
+    poly(
+        p,
+        &[
+            u(-0.30, -0.52),
+            u(0.30, -0.52),
+            u(0.42, -0.14),
+            u(-0.42, -0.14),
+        ],
+        col,
+    );
+    rr(p, u(0.0, 0.20), s * 0.44, s * 0.76, s * 0.10, col);
+}
+
+/// Paper-plane (airplane mode).
+pub fn glyph_airplane(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let u = |x: f32, y: f32| c + vec2(x * s, y * s);
+    poly(p, &[u(0.0, -0.55), u(0.50, 0.42), u(0.0, 0.12)], col);
+    poly(p, &[u(0.0, -0.55), u(-0.50, 0.42), u(0.0, 0.12)], col);
+    poly(p, &[u(0.0, -0.55), u(0.10, 0.02), u(-0.10, 0.02)], col);
+}
+
+/// Auto-rotate (circular arrow).
+pub fn glyph_rotate(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    arc(p, c, s * 0.52, s * 0.15, -60.0, 215.0, col);
+    let a = (-60.0f32).to_radians();
+    let tip = pos2(c.x + s * 0.52 * a.cos(), c.y + s * 0.52 * a.sin());
+    poly(
+        p,
+        &[
+            pos2(tip.x + s * 0.02, tip.y - s * 0.24),
+            pos2(tip.x + s * 0.26, tip.y + s * 0.06),
+            pos2(tip.x - s * 0.18, tip.y + s * 0.14),
+        ],
+        col,
+    );
+}
+
+/// Lightning bolt (battery saver).
+pub fn glyph_bolt(p: &Painter, c: Pos2, s: f32, col: Color32) {
+    let u = |x: f32, y: f32| c + vec2(x * s, y * s);
+    poly(p, &[u(0.14, -0.60), u(-0.34, 0.08), u(-0.02, 0.08)], col);
+    poly(p, &[u(-0.14, 0.60), u(0.34, -0.08), u(0.02, -0.08)], col);
+}

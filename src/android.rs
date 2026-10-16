@@ -14,8 +14,12 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
+    // Explicitly request the glow (OpenGL ES) backend with vsync: on Android
+    // this drives the NativeActivity's hardware-accelerated EGL surface.
     let options = eframe::NativeOptions {
         android_app: Some(app),
+        renderer: eframe::Renderer::Glow,
+        vsync: true,
         ..Default::default()
     };
 

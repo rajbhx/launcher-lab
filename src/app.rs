@@ -13,6 +13,9 @@
 //! * recents: swipe up on a card dismisses it, drag across = carousel
 //! * shelf: swipe left closes; tap cards = getCard; hold a memo = deleteCard
 //! * hold empty home = light/dark chrome; double-tap empty home = lock demo
+//! * swipe down from the status bar   -> notification shade (tiles/brightness/notifs)
+//! * tap any app                     -> in-app demo preview (reveal animation)
+//! * hold an app in the drawer       -> hide it; hold it in Hidden Space to restore
 
 use eframe::egui::{self, Color32, Context, Pos2, Rect, Vec2};
 
@@ -38,6 +41,25 @@ pub struct Task {
     pub x_off: f32,
 }
 
+/// One row of the reconstructed notification shade.
+#[derive(Clone, Debug)]
+pub struct Notif {
+    pub app: App,
+    pub title: String,
+    pub body: String,
+    pub when: String,
+    pub accent: u32,
+}
+
+/// Full-screen demo preview of a "launched" app; `t` drives the reveal that
+/// grows out of the tapped icon (`src`).
+#[derive(Clone, Debug)]
+pub struct OpenApp {
+    pub app: App,
+    pub t: f32,
+    pub src: Rect,
+}
+
 /// Info captured on touch-down (long-press targets and the hold-to-unlock pad).
 struct PressInfo {
     pos: Pos2,
@@ -46,12 +68,20 @@ struct PressInfo {
     card: Option<String>,
     /// Hidden-item name when the press started on a hidden-space item.
     hidden_item: Option<String>,
+    /// Drawer app a long-press would hide from the listing.
+    hide_app: Option<App>,
+    /// Hidden-space app a long-press would restore to the drawer.
+    hidden_app: Option<App>,
     /// Press started on a long-pressable menu glyph (⋮).
     menu: bool,
     /// Press started on plain background (home, no hit).
     bg: bool,
     /// Press started on the Hidden Space hold pad.
     unlock: bool,
+    /// Press started in the status-bar band (pull down = shade).
+    status: bool,
+    /// Press started on the shade brightness slider.
+    bright: bool,
     /// The long-press action already fired for this press.
     consumed: bool,
 }
@@ -103,6 +133,21 @@ pub struct LauncherLab {
     pub theme_dark: bool,
     pub toast: Option<(String, f32)>,
     pub time: clock::TimeParts,
+    /// Shade pull progress (0 closed, 1 open).
+    pub shade_t: f32,
+    /// Screen brightness 0.12..=1.0 (dims every surface).
+    pub brightness: f32,
+    /// Quick-toggle states: Wi-Fi, Bluetooth, Flashlight, Airplane,
+    /// Auto-rotate, Battery saver.
+    pub tiles: [bool; 6],
+    /// Demo notifications shown in the shade.
+    pub notifs: Vec<Notif>,
+    /// Demo preview of the last "launched" app.
+    pub open_app: Option<OpenApp>,
+    /// First-run gesture guide.
+    pub onboard: bool,
+    /// Drawer apps hidden into the Hidden Space.
+    pub hidden_apps: Vec<App>,
     /// Monotonic input time (seconds) of the current frame.
     now: f64,
     /// Hit rectangles rebuilt during painting, in paint (z) order.
@@ -187,8 +232,37 @@ impl LauncherLab {
             folder: None,
             locked_ui: false,
             theme_dark: true,
-            toast: Some(("Hold empty home: light/dark chrome".into(), 2.6)),
+            toast: Some(("Swipe down from the status bar for the shade".into(), 2.6)),
             time: clock::now(),
+            shade_t: 0.0,
+            brightness: 0.88,
+            tiles: [true, false, false, false, true, false],
+            notifs: vec![
+                Notif {
+                    app: App::Weather,
+                    title: "Weather".into(),
+                    body: "Cloudy with sunny intervals. High 84\u{00B0}".into(),
+                    when: "now".into(),
+                    accent: 0x17B9E8,
+                },
+                Notif {
+                    app: App::Messages,
+                    title: "Messages".into(),
+                    body: "Aarav: Are we still on for lunch?".into(),
+                    when: "2m".into(),
+                    accent: 0x16B879,
+                },
+                Notif {
+                    app: App::PlayStore,
+                    title: "Play Store".into(),
+                    body: "3 apps updated in the background".into(),
+                    when: "1h".into(),
+                    accent: 0x00A0FF,
+                },
+            ],
+            open_app: None,
+            onboard: true,
+            hidden_apps: Vec::new(),
             now: 0.0,
             hits: Vec::new(),
             unlock_hold: 0.0,
@@ -207,19 +281,45 @@ impl LauncherLab {
         self.toast = Some((msg.into(), 2.2));
     }
 
-    /// Topmost allowed hit at `pos`.
-    fn hit_at(&self, pos: Pos2) -> Option<Hit> {
+    /// Topmost allowed hit at `pos`, together with its rectangle.
+    fn hit_at(&self, pos: Pos2) -> Option<(Rect, Hit)> {
         self.hits
             .iter()
             .rev()
             .find(|(r, h)| r.contains(pos) && self.hit_allowed(h))
-            .map(|(_, h)| h.clone())
+            .map(|(r, h)| (*r, h.clone()))
+    }
+
+    /// Apps currently listed in the drawer (hidden ones live in Hidden Space).
+    pub fn visible_drawer(&self) -> Vec<App> {
+        icons::DRAWER
+            .iter()
+            .copied()
+            .filter(|a| !self.hidden_apps.contains(a))
+            .collect()
     }
 
     /// Only hits belonging to the current surface are live.
     fn hit_allowed(&self, h: &Hit) -> bool {
+        if self.open_app.is_some() {
+            return matches!(h, Hit::AppBack | Hit::AppAction(_));
+        }
+        if self.onboard && self.screen == Screen::Home {
+            return matches!(h, Hit::OnboardOk);
+        }
         if self.locked_ui {
             return matches!(h, Hit::UnlockTap);
+        }
+        if self.screen == Screen::Shade {
+            return matches!(
+                h,
+                Hit::ShadeTile(_)
+                    | Hit::ShadeHandle
+                    | Hit::ShadeClose
+                    | Hit::ShadeBrightness
+                    | Hit::ShadeClearAll
+                    | Hit::ShadeNotif(_)
+            );
         }
         match self.screen {
             Screen::Hidden => {
@@ -249,6 +349,7 @@ impl LauncherLab {
                 }
                 true
             }
+            Screen::Shade => false,
         }
     }
 
@@ -263,7 +364,7 @@ impl LauncherLab {
         }
     }
 
-    fn launch(&mut self, app: App) {
+    fn launch(&mut self, app: App, src: Rect) {
         let name = app.name().to_string();
         self.tasks.insert(
             0,
@@ -280,7 +381,23 @@ impl LauncherLab {
         );
         self.tasks.truncate(6);
         self.carousel = 0;
-        self.toast(format!("Launching {name} (demo)"));
+        if self.screen == Screen::Shade {
+            self.screen = Screen::Home;
+        }
+        self.open_app = Some(OpenApp { app, t: 0.0, src });
+        self.toast(format!("{name} - demo preview"));
+    }
+
+    /// Resume a recents card: bring it to the front and preview it.
+    fn resume(&mut self, i: usize, src: Rect) {
+        if i < self.tasks.len() {
+            let t = self.tasks.remove(i);
+            let app = t.app;
+            self.tasks.insert(0, t);
+            self.carousel = 0;
+            self.open_app = Some(OpenApp { app, t: 0.0, src });
+            self.toast(format!("Resumed {} (demo)", app.name()));
+        }
     }
 
     fn dismiss_task(&mut self, i: usize) {
@@ -292,6 +409,8 @@ impl LauncherLab {
     fn long_press(
         &mut self,
         card: Option<String>,
+        hide_app: Option<App>,
+        hidden_app: Option<App>,
         hidden_item: Option<String>,
         menu: bool,
         bg: bool,
@@ -302,6 +421,14 @@ impl LauncherLab {
             } else {
                 self.toast("Card is publisher-owned (getCard only)");
             }
+        } else if let Some(a) = hide_app {
+            if !self.hidden_apps.contains(&a) {
+                self.hidden_apps.push(a);
+            }
+            self.toast(format!("Hidden: {} - in Hidden Space", a.name()));
+        } else if let Some(a) = hidden_app {
+            self.hidden_apps.retain(|x| *x != a);
+            self.toast(format!("Restored {} to the drawer", a.name()));
         } else if let Some(name) = hidden_item {
             self.hidden.unhide_item(&name);
             self.toast(format!("Unhidden {name} (demo)"));
@@ -313,7 +440,7 @@ impl LauncherLab {
             } else {
                 self.toast("Hidden Space password OFF (demo)");
             }
-        } else if bg && self.screen == Screen::Home {
+        } else if bg && self.screen == Screen::Home && !self.onboard && self.open_app.is_none() {
             self.theme_dark = !self.theme_dark;
             let s = if self.theme_dark { "on" } else { "off" };
             self.toast(format!("Dark chrome: {s}"));
@@ -329,28 +456,48 @@ impl LauncherLab {
             t: time,
             card: None,
             hidden_item: None,
+            hide_app: None,
+            hidden_app: None,
             menu: false,
             bg: hit.is_none(),
             unlock: false,
+            status: false,
+            bright: false,
             consumed: false,
         };
         match &hit {
-            Some(Hit::ShelfCard(i)) => {
+            Some((_, Hit::ShelfCard(i))) => {
                 if let Some(card) = self.cards.cards().get(*i) {
                     if card.channel == "memo" {
                         pr.card = Some(card.tag.clone());
                     }
                 }
             }
-            Some(Hit::HiddenItem(i)) => {
-                if let Some(it) = self.hidden.items().get(*i) {
+            Some((_, Hit::HiddenItem(i))) => {
+                if *i < self.hidden_apps.len() {
+                    pr.hidden_app = Some(self.hidden_apps[*i]);
+                } else if let Some(it) = self.hidden.items().get(*i - self.hidden_apps.len()) {
                     pr.hidden_item = Some(it.name.clone());
                 }
             }
-            Some(Hit::HiddenMenu) | Some(Hit::DrawerMenu) => pr.menu = true,
-            Some(Hit::HiddenHold) => pr.unlock = true,
+            Some((_, Hit::DrawerApp(i))) => {
+                if let Some(a) = self.visible_drawer().get(*i) {
+                    pr.hide_app = Some(*a);
+                }
+            }
+            Some((_, Hit::HiddenMenu)) | Some((_, Hit::DrawerMenu)) => pr.menu = true,
+            Some((_, Hit::HiddenHold)) => pr.unlock = true,
             _ => {}
         }
+        pr.status = self.screen == Screen::Home
+            && !self.locked_ui
+            && self.open_app.is_none()
+            && self.folder.is_none()
+            && !self.shelf_open_or_visible()
+            && pos.y < screen.top() + 26.0;
+        pr.bright = self.screen == Screen::Shade
+            && (pos.y - screen.top()) >= views::SHADE_BRIGHT_TOP
+            && (pos.y - screen.top()) <= views::SHADE_BRIGHT_BOTTOM;
         let (consumer, origin) = state::classify_start(
             self.screen,
             self.locked_ui,
@@ -393,13 +540,33 @@ impl LauncherLab {
         let w = screen.width();
         let h = screen.height();
 
-        if self.locked_ui {
+        if self.locked_ui || self.open_app.is_some() {
             return;
         }
-        if let Some(pr) = &self.press {
-            if pr.unlock {
-                return;
-            }
+        let (pr_unlock, pr_bright, pr_status, pr_x) = match &self.press {
+            Some(pr) => (pr.unlock, pr.bright, pr.status, pr.pos.x),
+            None => (false, false, false, 0.0),
+        };
+        if pr_unlock {
+            return;
+        }
+        if pr_bright {
+            // Brightness slider: map the finger onto 0.12..=1.0.
+            let x0 = screen.left() + views::SHADE_SLIDER_LEFT;
+            let x1 = screen.right() - views::SHADE_SLIDER_RIGHT;
+            let f = ((pr_x + tdx - x0) / (x1 - x0).max(1.0)).clamp(0.0, 1.0);
+            self.brightness = 0.12 + f * 0.88;
+            return;
+        }
+        if pr_status {
+            // Pull the shade down from the status bar.
+            self.shade_t = (tdy / (h * 0.40)).clamp(0.0, 1.0);
+            return;
+        }
+        if self.screen == Screen::Shade {
+            // Push it back up.
+            self.shade_t = (1.0 + tdy / (h * 0.40)).clamp(0.0, 1.0);
+            return;
         }
 
         // Shelf overlay (full-screen, above home).
@@ -426,7 +593,7 @@ impl LauncherLab {
                     .as_ref()
                     .map(|p| p.pos.y > screen.top() + 118.0)
                     .unwrap_or(false);
-                let rows = icons::DRAWER.len().div_ceil(5);
+                let rows = self.visible_drawer().len().div_ceil(5);
                 let content_h = rows as f32 * 96.0 + 40.0;
                 let view_h = (h - 118.0).max(1.0);
                 let max = (content_h - view_h).max(0.0);
@@ -496,6 +663,11 @@ impl LauncherLab {
         let tap = g.moved < 14.0 && (time - g.t) < 0.35;
         let consumed = pr.as_ref().map(|p| p.consumed).unwrap_or(false);
         let unlock = pr.as_ref().map(|p| p.unlock).unwrap_or(false);
+        let status = pr.as_ref().map(|p| p.status).unwrap_or(false);
+        let from_left_edge = pr
+            .as_ref()
+            .map(|p| p.pos.x < screen.left() + 26.0)
+            .unwrap_or(false);
         self.unlock_hold = 0.0;
 
         if unlock {
@@ -508,6 +680,53 @@ impl LauncherLab {
 
         let w = screen.width();
         let h = screen.height();
+
+        // In-app demo preview: chevron tap or left-edge swipe leaves it.
+        if self.open_app.is_some() {
+            if from_left_edge && dx > w * 0.15 {
+                self.open_app = None;
+                return;
+            }
+            if tap {
+                self.handle_tap(pos, time);
+            }
+            return;
+        }
+
+        // Lock screen: swipe up (a tap also unlocks via handle_tap).
+        if self.locked_ui {
+            if -dy > h * 0.10 {
+                self.locked_ui = false;
+                self.toast("Unlocked (demo)");
+            }
+            return;
+        }
+
+        // Status-band pull-down opens the notification shade.
+        if status {
+            if self.shade_t > 0.35 || vel.y > 500.0 {
+                self.screen = Screen::Shade;
+            }
+            return;
+        }
+
+        // Open shade: swipe up closes it.
+        if self.screen == Screen::Shade {
+            let out = state::classify_release(
+                g.consumer,
+                self.screen,
+                dx,
+                dy,
+                vel.x,
+                vel.y,
+                w,
+                h,
+            );
+            if matches!(out, ReleaseOutcome::GoHome) || self.shade_t < 0.6 {
+                self.screen = Screen::Home;
+            }
+            return;
+        }
 
         // Shelf overlay first: it covers the home surface.
         if self.screen == Screen::Home && (self.shelf_open || self.shelf_t > 0.02) {
@@ -636,106 +855,161 @@ impl LauncherLab {
     fn handle_tap(&mut self, pos: Pos2, time: f64) {
         let hit = self.hit_at(pos);
         match hit {
-            Some(Hit::Pill) => self.toast("Google Search (demo)"),
-            Some(Hit::PageDot(i)) => {
+            Some((_, Hit::Pill)) => self.toast("Google Search (demo)"),
+            Some((_, Hit::PageDot(i))) => {
                 self.pager.current = i.min(self.pager.pages.saturating_sub(1));
                 self.pager.offset = 0.0;
             }
-            Some(Hit::Caret) => {
+            Some((_, Hit::Caret)) => {
                 self.screen = Screen::Drawer;
                 self.open_drawer_hint();
             }
-            Some(Hit::HomeItem { page, idx }) => match views::item_at(page, idx) {
-                Some(views::HomeItem::App(a)) => self.launch(a),
+            Some((hr, Hit::HomeItem { page, idx })) => match views::item_at(page, idx) {
+                Some(views::HomeItem::App(a)) => self.launch(a, hr),
                 Some(views::HomeItem::Folder { .. }) => {
                     self.folder = Some((page, idx));
                 }
                 None => {}
             },
-            Some(Hit::Dock(i)) => {
+            Some((hr, Hit::Dock(i))) => {
                 if let Some(a) = icons::DOCK.get(i) {
-                    self.launch(*a);
+                    self.launch(*a, hr);
                 }
             }
-            Some(Hit::FolderClose) => self.folder = None,
-            Some(Hit::FolderItem(i)) => {
+            Some((_, Hit::FolderClose)) => self.folder = None,
+            Some((hr, Hit::FolderItem(i))) => {
                 if let Some((page, idx)) = self.folder {
                     if let Some(views::HomeItem::Folder { apps, .. }) = views::item_at(page, idx) {
                         if let Some(a) = apps.get(i) {
-                            self.launch(*a);
+                            self.launch(*a, hr);
                         }
                     }
                 }
                 self.folder = None;
             }
-            Some(Hit::DrawerApp(i)) => {
-                if let Some(a) = icons::DRAWER.get(i) {
-                    self.launch(*a);
+            Some((hr, Hit::DrawerApp(i))) => {
+                if let Some(a) = self.visible_drawer().get(i) {
+                    self.launch(*a, hr);
                 }
                 self.screen = Screen::Home;
             }
-            Some(Hit::DrawerSearch) => self.toast("Search apps (demo)"),
-            Some(Hit::DrawerMenu) => self.toast("Hold this glyph: Hidden Space password"),
-            Some(Hit::HiddenClose) => self.screen = Screen::Drawer,
-            Some(Hit::HiddenAdd) => self.toast("Add apps to Hidden Space (demo)"),
-            Some(Hit::HiddenMenu) => self.toast("Hidden Space options"),
-            Some(Hit::HiddenItem(i)) => {
-                if let Some(it) = self.hidden.items().get(i) {
+            Some((_, Hit::DrawerSearch)) => self.toast("Search apps (demo)"),
+            Some((_, Hit::DrawerMenu)) => self.toast("Hold this glyph: Hidden Space password"),
+            Some((_, Hit::HiddenClose)) => self.screen = Screen::Drawer,
+            Some((_, Hit::HiddenAdd)) => self.toast("Add apps to Hidden Space (demo)"),
+            Some((_, Hit::HiddenMenu)) => self.toast("Hidden Space options"),
+            Some((hr, Hit::HiddenItem(i))) => {
+                if i < self.hidden_apps.len() {
+                    let a = self.hidden_apps[i];
+                    self.launch(a, hr);
+                } else if let Some(it) = self.hidden.items().get(i - self.hidden_apps.len()) {
                     let n = it.name.clone();
                     self.toast(format!("Open {n} (demo)"));
                 }
             }
-            Some(Hit::HiddenHold) => {}
-            Some(Hit::ShelfTool(i)) => {
+            Some((_, Hit::HiddenHold)) => {}
+            Some((_, Hit::ShelfTool(i))) => {
                 const NAMES: [&str; 5] = ["Calculator", "Selfie", "New timer", "Send files", "New tab"];
                 if let Some(n) = NAMES.get(i) {
                     self.toast(format!("Toolbox: {n} (demo)"));
                 }
             }
-            Some(Hit::ShelfApp(i)) => {
+            Some((hr, Hit::ShelfApp(i))) => {
                 if let Some(a) = icons::SHELF_RECENTS.get(i) {
-                    self.launch(*a);
+                    self.launch(*a, hr);
                 }
             }
-            Some(Hit::ShelfAction) => self.toast("Parking Location: action (demo)"),
-            Some(Hit::ShelfNewNote) => {
+            Some((_, Hit::ShelfAction)) => self.toast("Parking Location: action (demo)"),
+            Some((_, Hit::ShelfNewNote)) => {
                 self.memo_seq += 1;
                 let tag = format!("memo-{}", self.memo_seq);
                 let body = format!("Reconstructed CardProvider note #{}.", self.memo_seq);
                 let _ = self.cards.post_card("memo", &tag, "Memo", &body, 0xFFB300);
                 self.toast("postCard(memo) (demo)");
             }
-            Some(Hit::ShelfCard(i)) => {
+            Some((_, Hit::ShelfCard(i))) => {
                 if let Some(card) = self.cards.cards().get(i) {
                     let hyphen = if card.channel == "memo" { " - hold to delete" } else { "" };
                     self.toast(format!("getCard({}, {}){hyphen}", card.channel, card.tag));
                 }
             }
-            Some(Hit::Task(i)) => {
-                if let Some(t) = self.tasks.get(i) {
-                    let n = t.title.clone();
-                    self.carousel = i;
-                    self.toast(format!("Resume {n} (demo)"));
-                }
+            Some((hr, Hit::Task(i))) => {
+                let src = Rect::from_center_size(hr.center(), vec2(96.0, 96.0));
+                self.resume(i, src);
             }
-            Some(Hit::TaskIcon(i)) => {
-                if let Some(t) = self.tasks.get(i) {
-                    let n = t.title.clone();
-                    self.carousel = i;
-                    self.toast(format!("Switch to {n} (demo)"));
-                }
+            Some((hr, Hit::TaskIcon(i))) => {
+                let src = Rect::from_center_size(hr.center(), vec2(96.0, 96.0));
+                self.resume(i, src);
             }
-            Some(Hit::TaskClearAll) => {
+            Some((_, Hit::TaskClearAll)) => {
                 self.tasks.clear();
                 self.carousel = 0;
                 self.toast("Cleared all tasks (demo)");
             }
-            Some(Hit::UnlockTap) => {
+            Some((_, Hit::UnlockTap)) => {
                 self.locked_ui = false;
                 self.toast("Unlocked (demo)");
             }
+            Some((_, Hit::AppBack)) => {
+                self.open_app = None;
+            }
+            Some((_, Hit::AppAction(i))) => {
+                let app = self.open_app.as_ref().map(|o| o.app);
+                let msg = match (app, i) {
+                    (Some(App::Camera), 0) => "Snap! (demo photo)".to_string(),
+                    (Some(App::Camera), _) => "Camera flipped (demo)".to_string(),
+                    (Some(App::PlayStore | App::PlayMovies), _) => "Install queued (demo)".to_string(),
+                    (Some(App::Music | App::PlayMusic | App::Recorder), 1) => {
+                        "Play / pause (demo)".to_string()
+                    }
+                    (Some(App::Weather), _) => "Forecast refreshed (demo)".to_string(),
+                    (Some(a), _) => format!("{}: action {} (demo)", a.name(), i),
+                    (None, _) => "Action (demo)".to_string(),
+                };
+                self.toast(msg);
+            }
+            Some((_, Hit::ShadeHandle)) | Some((_, Hit::ShadeClose)) => {
+                self.screen = Screen::Home;
+            }
+            Some((_, Hit::ShadeTile(i))) => {
+                const NAMES: [&str; 6] = [
+                    "Wi-Fi",
+                    "Bluetooth",
+                    "Flashlight",
+                    "Airplane",
+                    "Auto-rotate",
+                    "Battery saver",
+                ];
+                if let Some(t) = self.tiles.get_mut(i) {
+                    *t = !*t;
+                }
+                if let Some(n) = NAMES.get(i) {
+                    let on = self.tiles.get(i).copied().unwrap_or(false);
+                    self.toast(format!("{n} {}", if on { "on" } else { "off" }));
+                }
+            }
+            Some((_, Hit::ShadeBrightness)) => {}
+            Some((_, Hit::ShadeClearAll)) => {
+                self.notifs.clear();
+                self.toast("Notifications cleared (demo)");
+            }
+            Some((hr, Hit::ShadeNotif(i))) => {
+                let a = self.notifs.get(i).map(|n| n.app);
+                if let Some(a) = a {
+                    self.screen = Screen::Home;
+                    self.launch(a, hr);
+                }
+            }
+            Some((_, Hit::OnboardOk)) => {
+                self.onboard = false;
+            }
             None => {
-                if self.screen == Screen::Home && self.folder.is_none() && !self.shelf_open {
+                if self.screen == Screen::Home
+                    && self.folder.is_none()
+                    && !self.shelf_open
+                    && !self.onboard
+                    && self.open_app.is_none()
+                {
                     if let Some((t0, p0)) = self.last_tap {
                         if time - t0 < 0.35 && (pos - p0).length() < 56.0 {
                             self.locked_ui = true;
@@ -761,11 +1035,13 @@ impl LauncherLab {
         let hidden_target = if self.screen == Screen::Hidden { 1.0 } else { 0.0 };
         let lock_target = if self.locked_ui { 1.0 } else { 0.0 };
         let folder_target = if self.folder.is_some() { 1.0 } else { 0.0 };
+        let shade_target = if self.screen == Screen::Shade { 1.0 } else { 0.0 };
 
         if self.active.is_none() {
             self.drawer_t = theme::approach(self.drawer_t, drawer_target, dt, 14.0);
             self.overview_t = theme::approach(self.overview_t, overview_target, dt, 14.0);
             self.lock_t = theme::approach(self.lock_t, lock_target, dt, 16.0);
+            self.shade_t = theme::approach(self.shade_t, shade_target, dt, 14.0);
             // Pager offset settles when no gesture is live.
             if self.pager.offset != 0.0 {
                 self.pager.offset = theme::approach(self.pager.offset, 0.0, dt, 18.0);
@@ -779,6 +1055,11 @@ impl LauncherLab {
         }
         self.hidden_t = theme::approach(self.hidden_t, hidden_target, dt, 14.0);
         self.folder_t = theme::approach(self.folder_t, folder_target, dt, 18.0);
+
+        // App preview reveal animation.
+        if let Some(o) = &mut self.open_app {
+            o.t = (o.t + dt * 3.4).min(1.0);
+        }
 
         // Shelf slides open/closed (except while dragging it).
         if self.active.is_none() {
@@ -826,13 +1107,15 @@ impl LauncherLab {
         if let Some(pr) = &self.press {
             if !pr.consumed && self.now - pr.t > 0.65 {
                 let card = pr.card.clone();
+                let hide_app = pr.hide_app;
+                let hidden_app = pr.hidden_app;
                 let hidden_item = pr.hidden_item.clone();
                 let menu = pr.menu;
                 let bg = pr.bg;
                 if let Some(p) = &mut self.press {
                     p.consumed = true;
                 }
-                self.long_press(card, hidden_item, menu, bg);
+                self.long_press(card, hide_app, hidden_app, hidden_item, menu, bg);
             }
         }
 

@@ -9,9 +9,10 @@ Launcher Lab reconstructs the interaction model that a static reverse-engineerin
 `*InputConsumer` gesture-routing state machine, the Shelf card/channel contract, the Hidden
 Space flag model, and the recents/Overview flow.
 
-> **Status:** demo. It is a real, installable launcher-shaped app — but tiles don't launch
-> other apps, the recents list is simulated, and the APK is signed with a project key
-> (built and signed entirely by GitHub Actions).
+> **Status:** demo (v0.3.0). It is a real, installable launcher-shaped app — every icon opens
+> a full-screen reconstructed preview of that app (so the demo reads everywhere), the recents
+> list is simulated, and the APK is signed with a project key (built and signed entirely by
+> GitHub Actions).
 
 ## Download
 
@@ -41,6 +42,13 @@ clock/weather widget with the signature red leading digit, the Google pill, the 
 `^` caret + page dots are all drawn live with `egui` primitives — no image assets ship with
 the app.
 
+Every app gets an in-app **demo preview**: tapping an icon (home, dock, drawer, folder, shelf,
+recents or a notification) opens a full-screen mock with a zoom-reveal animation — Chrome
+with an address bar and result rows, Messages with chat bubbles, Camera with a viewfinder and
+shutter, Gallery with a photo grid, Play Store with Install rows, Music with a player, plus
+Weather, Clock, Calculator, Maps and video surfaces; everything else gets a skeleton page.
+Back via the chevron or a left-edge swipe. A first-run card maps every gesture.
+
 | Gesture / UI element | Behaviour (reconstructed from) |
 | --- | --- |
 | Swipe left / right on home | 5-page pager (`default_workspace_5x5_7.xml` page layout) |
@@ -53,10 +61,14 @@ the app.
 | Drawer: swipe **right** | **Hidden Space**; swipe down closes; drag scrolls the grid |
 | Hidden Space: hold the ring | Unlock; hold the ⋮ menu glyph to toggle the password flag (`HiddenSpaceModel`) |
 | Hidden items: hold an icon | Unhide (`unhideItem`); tap = open demo |
+| Drawer: hold an app | Hide it (moves to Hidden Space); hold it there to restore it |
+| Swipe **down from the status bar** | **Notification shade**: clock, quick tiles, brightness, notifications |
+| Shade: tap a tile / drag the slider | Quick-setting toggles; the brightness slider dims the whole surface |
+| Tap an app or a notification | In-app demo preview; back = chevron tap or left-edge swipe |
 | Recents: swipe up on a card | Dismiss the task; drag across = carousel; Clear all empties it |
 | Shelf: tap a card | `getCard` readout; hold a memo → `deleteCard`; "+ New note" → `postCard` |
 | Hold empty home | Light/dark chrome toggle (dark pill ↔ light pill) |
-| Double-tap empty home | Device-locked overlay (`DeviceLockedInputConsumer`); tap to unlock |
+| Double-tap empty home | Device-locked overlay (`DeviceLockedInputConsumer`); swipe up or tap to unlock |
 
 The shelf's Toolbox / Recent apps / Parking Location cards mirror the stock 4.4.8 shelf,
 followed by live cards from the reconstructed `CardProvider` channel store
@@ -89,9 +101,12 @@ assets/
 └── fonts/        Roboto Regular/Light/Medium (Apache-2.0, see LICENSE.txt)
 ```
 
-Rendering is `egui`/`eframe` (GLES via glow). The UI is 100% custom-painted: rounded tiles,
-task cards, shelf, unlock ring, wallpaper — no widgets, no bitmaps. Frame-rate independent
-exponential animations keep transitions smooth.
+Rendering is `egui`/`eframe` on the **glow (OpenGL ES) backend**: the Android entry point
+explicitly requests `Renderer::Glow` with `vsync: true`, so frames are drawn by the GPU into
+the `NativeActivity`'s hardware-accelerated EGL surface and paced at the display refresh
+rate. The UI is 100% custom-painted: rounded tiles, task cards, shelf, unlock ring,
+notification shade, wallpaper — no widgets, no bitmaps. Frame-rate independent exponential
+animations keep transitions smooth.
 
 ## How it's built (GitHub Actions)
 
@@ -114,8 +129,8 @@ targetSdk 34, `build_targets = ["aarch64-linux-android"]`, portrait, fullscreen 
 
 * Signed with a project-generated key (stable across builds, so in-place updates work), but
   it is not a Play-ready signing setup.
-* Tiles, tasks and cards are demo data; nothing launches real apps (that would need the
-  system's privileged recents/task APIs).
+* Tiles, tasks and cards are demo data; launching opens reconstructed in-app previews, not
+  real apps (that would need the system's privileged recents/task APIs).
 * Only `arm64-v8a` is built — fine for the OnePlus 7, not for old 32-bit devices.
 * The launcher does not register as a HOME replacement on purpose (safe to try).
 

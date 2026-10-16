@@ -60,6 +60,8 @@ pub enum Screen {
     Drawer,
     Overview,
     Hidden,
+    /// Notification shade (SystemUI surface, reconstructed for the demo).
+    Shade,
 }
 
 /// Edge zone a touch started in.
@@ -148,6 +150,7 @@ pub fn classify_start(
         }
         Screen::Hidden => (ConsumerType::NoOp, GestureOrigin::Center),
         Screen::Drawer => (ConsumerType::NoOp, GestureOrigin::Center),
+        Screen::Shade => (ConsumerType::NoOp, GestureOrigin::Center),
     }
 }
 
@@ -193,6 +196,13 @@ pub fn classify_release(
             if dx > w * 0.16 || vx > 500.0 {
                 ReleaseOutcome::OpenHidden
             } else if dy > h * 0.10 || vy > 550.0 {
+                ReleaseOutcome::GoHome
+            } else {
+                ReleaseOutcome::Stay
+            }
+        }
+        (Screen::Shade, ConsumerType::NoOp) => {
+            if dy < -h * 0.08 || vy < -500.0 {
                 ReleaseOutcome::GoHome
             } else {
                 ReleaseOutcome::Stay
@@ -431,6 +441,28 @@ mod tests {
             300.0,
             0.0,
             700.0,
+            W,
+            H,
+        );
+        assert_eq!(out, ReleaseOutcome::GoHome);
+    }
+
+    #[test]
+    fn shade_screen_is_noop() {
+        let (c, o) = classify_start(Screen::Shade, false, 500.0, 400.0, W, H, z());
+        assert_eq!(c, ConsumerType::NoOp);
+        assert_eq!(o, GestureOrigin::Center);
+    }
+
+    #[test]
+    fn shade_swipe_up_closes() {
+        let out = classify_release(
+            ConsumerType::NoOp,
+            Screen::Shade,
+            0.0,
+            -250.0,
+            0.0,
+            -700.0,
             W,
             H,
         );

@@ -45,6 +45,19 @@ pub enum Hit {
     TaskIcon(usize),
     TaskClearAll,
     UnlockTap,
+    /// In-app demo preview: back chevron.
+    AppBack,
+    /// In-app demo preview: mock action button `i`.
+    AppAction(usize),
+    /// Notification shade.
+    ShadeTile(usize),
+    ShadeHandle,
+    ShadeClose,
+    ShadeBrightness,
+    ShadeClearAll,
+    ShadeNotif(usize),
+    /// First-run gesture guide button.
+    OnboardOk,
 }
 
 /// One entry on a home page — mirrors the favorites in
@@ -147,7 +160,7 @@ pub fn paint(app: &mut LauncherLab, p: &Painter, rect: Rect) {
     let mut hits = std::mem::take(&mut app.hits);
     let pal = theme::palette(app.theme_dark);
 
-    wallpaper::paint(p, rect);
+    wallpaper::paint(p, rect, app.pager.offset);
 
     draw_home(app, p, rect, &mut hits, &pal);
 
@@ -170,8 +183,23 @@ pub fn paint(app: &mut LauncherLab, p: &Painter, rect: Rect) {
     if app.folder_t > 0.001 {
         draw_folder(app, p, rect, &mut hits, &pal);
     }
+    if app.screen == Screen::Shade || app.shade_t > 0.001 {
+        draw_shade(app, p, rect, &mut hits, &pal);
+    }
+    if app.open_app.is_some() {
+        draw_app_mock(app, p, rect, &mut hits, &pal);
+    }
     if app.lock_t > 0.001 {
         draw_locked(app, p, rect, &mut hits);
+    }
+
+    // Brightness dim driven by the shade slider.
+    let dim = ((1.0 - app.brightness) * 0.55).clamp(0.0, 0.6);
+    if dim > 0.002 {
+        p.rect_filled(rect, CornerRadius::ZERO, theme::black(dim));
+    }
+    if app.onboard && app.screen == Screen::Home {
+        draw_onboarding(p, rect, &mut hits, &pal);
     }
 
     draw_status(app, p, rect);
@@ -486,10 +514,22 @@ fn draw_drawer(
     let grid_top = panel.top() + 118.0 - app.drawer_scroll;
     let slot_w = panel.width() / COLS as f32;
     let row_h = 96.0;
-    let rows = icons::DRAWER.len().div_ceil(COLS);
+    let visible = app.visible_drawer();
+    let rows = visible.len().div_ceil(COLS);
     let content_h = rows as f32 * row_h + 40.0;
     let view_h = (panel.height() - 118.0).max(1.0);
-    for (i, a) in icons::DRAWER.iter().enumerate() {
+    if visible.is_empty() {
+        label(
+            p,
+            pos2(panel.center().x, panel.top() + 240.0),
+            Align2::CENTER_CENTER,
+            "All apps live in Hidden Space",
+            theme::font(15.0),
+            pal.text_dim,
+            false,
+        );
+    }
+    for (i, a) in visible.iter().enumerate() {
         let cx = panel.left() + (i % COLS) as f32 * slot_w + slot_w * 0.5;
         let cy = grid_top + (i / COLS) as f32 * row_h + 38.0;
         if cy - 38.0 < panel.top() + 112.0 || cy + 44.0 > panel.bottom() - 6.0 {
@@ -597,23 +637,56 @@ fn draw_hidden(
             Hit::HiddenMenu,
         ));
 
+        // Real hidden apps first (their indices match `hidden_apps`), then
+        // the demo items of the reconstructed model.
+        let mut entries: Vec<(Option<App>, String, u32)> = Vec::new();
+        for ha in &app.hidden_apps {
+            entries.push((Some(*ha), ha.name().to_string(), ha.accent()));
+        }
+        for it in app.hidden.items() {
+            entries.push((None, it.name.clone(), it.accent));
+        }
+        if entries.is_empty() {
+            label(
+                p,
+                pos2(rect.center().x, rect.top() + 240.0),
+                Align2::CENTER_CENTER,
+                "No hidden apps",
+                theme::font(16.0),
+                theme::white(0.7 * a),
+                false,
+            );
+            label(
+                p,
+                pos2(rect.center().x, rect.top() + 268.0),
+                Align2::CENTER_CENTER,
+                "Hold an app in the drawer to hide it",
+                theme::font(13.0),
+                theme::white(0.45 * a),
+                false,
+            );
+        }
         let slot_w = rect.width() / COLS as f32;
-        for (i, it) in app.hidden.items().iter().enumerate() {
+        for (i, (oa, name, accent)) in entries.iter().enumerate() {
             let cx = rect.left() + (i % COLS) as f32 * slot_w + slot_w * 0.5;
             let cy = rect.top() + 96.0 + (i / COLS) as f32 * 96.0 + 32.0;
             let s = Rect::from_center_size(pos2(cx, cy), vec2(56.0, 56.0));
-            let letter = it
-                .name
-                .chars()
-                .next()
-                .map(|c| c.to_string())
-                .unwrap_or_default();
-            icons::draw_letter(p, s, it.accent, &letter);
+            match oa {
+                Some(ha) => ha.draw(p, s),
+                None => {
+                    let letter = name
+                        .chars()
+                        .next()
+                        .map(|c| c.to_string())
+                        .unwrap_or_default();
+                    icons::draw_letter(p, s, *accent, &letter);
+                }
+            }
             label(
                 p,
                 pos2(cx, cy + 40.0),
                 Align2::CENTER_CENTER,
-                &it.name,
+                name,
                 theme::font(13.0),
                 theme::white(0.86 * a),
                 false,
@@ -755,26 +828,37 @@ fn draw_toast(p: &Painter, rect: Rect, msg: &str, ttl: f32, pal: &Palette) {
 
 fn draw_locked(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect, Hit)>) {
     let a = app.lock_t;
-    p.rect_filled(rect, CornerRadius::ZERO, theme::black(0.92 * a));
+    p.rect_filled(rect, CornerRadius::ZERO, theme::black(0.94 * a));
     let cx = rect.center().x;
     label(
         p,
-        pos2(cx, rect.top() + 210.0),
+        pos2(cx, rect.top() + 190.0),
         Align2::CENTER_CENTER,
         &clock::clock_label(app.time),
-        theme::font_light(64.0),
+        theme::font_light(60.0),
         theme::white(0.95 * a),
         false,
     );
     label(
         p,
-        pos2(cx, rect.top() + 264.0),
+        pos2(cx, rect.top() + 238.0),
         Align2::CENTER_CENTER,
         &clock::date_label(app.time),
         theme::font(15.0),
         theme::white(0.7 * a),
         false,
     );
+    if !app.notifs.is_empty() {
+        label(
+            p,
+            pos2(cx, rect.top() + 266.0),
+            Align2::CENTER_CENTER,
+            &format!("{} notifications", app.notifs.len()),
+            theme::font(12.0),
+            theme::white(0.45 * a),
+            false,
+        );
+    }
     let lc = pos2(cx, rect.top() + rect.height() * 0.46);
     icons::arc(
         p,
@@ -795,11 +879,18 @@ fn draw_locked(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect,
         p,
         pos2(cx, rect.bottom() - 150.0),
         Align2::CENTER_CENTER,
-        "Tap to unlock",
+        "Swipe up or tap to unlock",
         theme::font(14.0),
         theme::white(0.65 * a),
         false,
     );
+    // Bottom shortcuts (decor): flashlight / camera.
+    let fl = pos2(rect.left() + 52.0, rect.bottom() - 64.0);
+    p.circle_filled(fl, 22.0, theme::white(0.10 * a));
+    icons::glyph_flashlight(p, fl, 20.0, theme::white(0.8 * a));
+    let cm = pos2(rect.right() - 52.0, rect.bottom() - 64.0);
+    p.circle_filled(cm, 22.0, theme::white(0.10 * a));
+    icons::glyph_shutter(p, cm, 9.0, theme::white(0.8 * a));
     hits.push((rect, Hit::UnlockTap));
 }
 
@@ -1238,4 +1329,998 @@ fn glyph_nav(p: &Painter, c: Pos2, s: f32, col: Color32) {
         &[u(-0.45, 0.50), u(0.0, -0.55), u(0.45, 0.50), u(0.0, 0.24)],
         col,
     );
+}
+
+// ------------------------------------------------------------------- shade
+
+/// Brightness slider band inside the shade panel (panel-top-relative). The
+/// drag handling in `app.rs` uses the same constants.
+pub(crate) const SHADE_BRIGHT_TOP: f32 = 246.0;
+pub(crate) const SHADE_BRIGHT_BOTTOM: f32 = 330.0;
+/// Left/right insets of the brightness slider inside the panel.
+pub(crate) const SHADE_SLIDER_LEFT: f32 = 40.0;
+pub(crate) const SHADE_SLIDER_RIGHT: f32 = 40.0;
+
+fn draw_shade(
+    app: &LauncherLab,
+    p: &Painter,
+    rect: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+    pal: &Palette,
+) {
+    let a = app.shade_t.clamp(0.0, 1.0);
+    let ph = (rect.height() * 0.72).clamp(500.0, 700.0);
+    let y0 = rect.top() - (1.0 - a) * ph;
+    let panel = Rect::from_min_max(pos2(rect.left(), y0 - 30.0), pos2(rect.right(), y0 + ph));
+
+    // Scrim below the panel (tap to close).
+    let below = Rect::from_min_max(pos2(rect.left(), y0 + ph), rect.max);
+    if below.height() > 1.0 {
+        p.rect_filled(below, CornerRadius::ZERO, theme::black(0.45 * a));
+        hits.push((below, Hit::ShadeClose));
+    }
+
+    icons::rrect(p, panel, 28.0, theme::with_alpha(pal.panel, 0.98 * a));
+
+    // Drag handle.
+    icons::rrect(
+        p,
+        Rect::from_center_size(pos2(panel.center().x, y0 + 14.0), vec2(38.0, 4.5)),
+        2.2,
+        theme::white(0.35 * a),
+    );
+    hits.push((
+        Rect::from_center_size(pos2(panel.center().x, y0 + 16.0), vec2(120.0, 44.0)),
+        Hit::ShadeHandle,
+    ));
+
+    // Clock + date.
+    label(
+        p,
+        pos2(panel.left() + 28.0, y0 + 56.0),
+        Align2::LEFT_CENTER,
+        &clock::clock_label(app.time),
+        theme::font_light(40.0),
+        theme::white(0.95 * a),
+        false,
+    );
+    label(
+        p,
+        pos2(panel.left() + 29.0, y0 + 86.0),
+        Align2::LEFT_CENTER,
+        &clock::date_label(app.time),
+        theme::font(13.0),
+        theme::white(0.6 * a),
+        false,
+    );
+    label(
+        p,
+        pos2(panel.right() - 28.0, y0 + 62.0),
+        Align2::RIGHT_CENTER,
+        "OxygenOS 10 shade",
+        theme::font(11.0),
+        theme::white(0.4 * a),
+        false,
+    );
+
+    // Quick tiles: 3 x 2.
+    const TILES: [&str; 6] = [
+        "Wi-Fi",
+        "Bluetooth",
+        "Flashlight",
+        "Airplane",
+        "Auto-rotate",
+        "Battery saver",
+    ];
+    let gx = panel.left() + 16.0;
+    let gw = (panel.width() - 32.0 - 24.0) / 3.0;
+    let th = 54.0;
+    for i in 0..6 {
+        let col = i % 3;
+        let row = i / 3;
+        let tr = Rect::from_min_size(
+            pos2(gx + col as f32 * (gw + 12.0), y0 + 116.0 + row as f32 * (th + 12.0)),
+            vec2(gw, th),
+        );
+        let on = app.tiles.get(i).copied().unwrap_or(false);
+        let bg = if on {
+            theme::with_alpha(pal.accent, 0.90 * a)
+        } else {
+            theme::white(0.10 * a)
+        };
+        icons::rrect(p, tr, 16.0, bg);
+        let ic = pos2(tr.left() + 21.0, tr.center().y);
+        let gc = if on { Color32::WHITE } else { theme::white(0.72 * a) };
+        match i {
+            0 => icons::glyph_wifi(p, ic, 19.0, gc),
+            1 => icons::glyph_bluetooth(p, ic, 19.0, gc),
+            2 => icons::glyph_flashlight(p, ic, 19.0, gc),
+            3 => icons::glyph_airplane(p, ic, 19.0, gc),
+            4 => icons::glyph_rotate(p, ic, 19.0, gc),
+            _ => icons::glyph_bolt(p, ic, 19.0, gc),
+        }
+        label(
+            p,
+            pos2(tr.left() + 42.0, tr.center().y),
+            Align2::LEFT_CENTER,
+            TILES[i],
+            theme::font(12.5),
+            if on { Color32::WHITE } else { theme::white(0.85 * a) },
+            false,
+        );
+        hits.push((tr, Hit::ShadeTile(i)));
+    }
+
+    // Brightness (drag to change; the app dims the whole surface).
+    label(
+        p,
+        pos2(gx, y0 + SHADE_BRIGHT_TOP + 8.0),
+        Align2::LEFT_CENTER,
+        "Brightness",
+        theme::font(12.0),
+        theme::white(0.55 * a),
+        false,
+    );
+    let pct = (app.brightness * 100.0).round() as i32;
+    label(
+        p,
+        pos2(panel.right() - 16.0, y0 + SHADE_BRIGHT_TOP + 8.0),
+        Align2::RIGHT_CENTER,
+        &format!("{pct}%"),
+        theme::font(12.0),
+        theme::white(0.55 * a),
+        false,
+    );
+    let sl = Rect::from_min_max(
+        pos2(panel.left() + SHADE_SLIDER_LEFT, y0 + SHADE_BRIGHT_TOP + 34.0),
+        pos2(panel.right() - SHADE_SLIDER_RIGHT, y0 + SHADE_BRIGHT_TOP + 46.0),
+    );
+    icons::rrect(p, sl, 6.0, theme::white(0.16 * a));
+    let f = ((app.brightness - 0.12) / 0.88).clamp(0.0, 1.0);
+    let fx = sl.left() + sl.width() * f;
+    icons::rrect(
+        p,
+        Rect::from_min_max(sl.min, pos2(fx, sl.max)),
+        6.0,
+        theme::with_alpha(pal.accent, 0.9 * a),
+    );
+    p.circle_filled(pos2(fx, sl.center().y), 9.0, theme::white(0.95 * a));
+    hits.push((
+        Rect::from_min_max(
+            pos2(sl.left() - 10.0, y0 + SHADE_BRIGHT_TOP + 20.0),
+            pos2(sl.right() + 10.0, y0 + SHADE_BRIGHT_TOP + 60.0),
+        ),
+        Hit::ShadeBrightness,
+    ));
+
+    // Notifications.
+    let mut ny = y0 + SHADE_BRIGHT_BOTTOM + 14.0;
+    label(
+        p,
+        pos2(gx, ny),
+        Align2::LEFT_CENTER,
+        "Notifications",
+        theme::font_medium(13.5),
+        theme::white(0.9 * a),
+        false,
+    );
+    let clr = Rect::from_center_size(pos2(panel.right() - 52.0, ny), vec2(66.0, 26.0));
+    icons::rrect(p, clr, 13.0, theme::white(0.08 * a));
+    label(
+        p,
+        clr.center(),
+        Align2::CENTER_CENTER,
+        "Clear all",
+        theme::font(11.0),
+        theme::white(0.7 * a),
+        false,
+    );
+    hits.push((clr, Hit::ShadeClearAll));
+    ny += 24.0;
+    if app.notifs.is_empty() {
+        label(
+            p,
+            pos2(panel.center().x, ny + 44.0),
+            Align2::CENTER_CENTER,
+            "No notifications",
+            theme::font(13.0),
+            theme::white(0.4 * a),
+            false,
+        );
+    }
+    for (i, n) in app.notifs.iter().take(3).enumerate() {
+        let nr = Rect::from_min_size(
+            pos2(panel.left() + 16.0, ny),
+            vec2(panel.width() - 32.0, 64.0),
+        );
+        icons::rrect(p, nr, 16.0, theme::white(0.06 * a));
+        n.app.draw(
+            p,
+            Rect::from_center_size(pos2(nr.left() + 30.0, nr.center().y), vec2(34.0, 34.0)),
+        );
+        label(
+            p,
+            pos2(nr.left() + 56.0, nr.top() + 21.0),
+            Align2::LEFT_CENTER,
+            &n.title,
+            theme::font_medium(13.0),
+            theme::white(0.95 * a),
+            false,
+        );
+        label(
+            p,
+            pos2(nr.right() - 14.0, nr.top() + 21.0),
+            Align2::RIGHT_CENTER,
+            &n.when,
+            theme::font(11.0),
+            theme::white(0.45 * a),
+            false,
+        );
+        label(
+            p,
+            pos2(nr.left() + 56.0, nr.top() + 42.0),
+            Align2::LEFT_CENTER,
+            &n.body,
+            theme::font(12.0),
+            theme::white(0.6 * a),
+            false,
+        );
+        hits.push((nr, Hit::ShadeNotif(i)));
+        ny += 72.0;
+    }
+}
+
+// -------------------------------------------------------------- app preview
+
+fn ease_out(t: f32) -> f32 {
+    let u = 1.0 - t.clamp(0.0, 1.0);
+    1.0 - u * u * u
+}
+
+fn bar(p: &Painter, x: f32, y: f32, w: f32, h: f32, col: Color32) {
+    icons::rrect(p, Rect::from_min_size(pos2(x, y), vec2(w, h)), h * 0.5, col);
+}
+
+fn draw_app_mock(
+    app: &LauncherLab,
+    p: &Painter,
+    rect: Rect,
+    hits: &mut Vec<(Rect, Hit)>,
+    _pal: &Palette,
+) {
+    let Some(o) = &app.open_app else {
+        return;
+    };
+    let e = ease_out(o.t);
+    let src = o.src.intersect(rect);
+    let clip = Rect::from_min_max(
+        pos2(
+            src.left() + (rect.left() - src.left()) * e,
+            src.top() + (rect.top() - src.top()) * e,
+        ),
+        pos2(
+            src.right() + (rect.right() - src.right()) * e,
+            src.bottom() + (rect.bottom() - src.bottom()) * e,
+        ),
+    );
+    let cp = p.with_clip_rect(clip);
+    let accent = theme::rgb(o.app.accent());
+
+    icons::rrect(&cp, rect, 0.0, theme::rgb(0x0F1115));
+    icons::rrect(
+        &cp,
+        Rect::from_min_size(rect.min, vec2(rect.width(), rect.height() * 0.30)),
+        0.0,
+        theme::with_alpha(accent, 0.18),
+    );
+
+    // Header.
+    let top = rect.top() + 30.0;
+    let header = Rect::from_min_size(pos2(rect.left(), top), vec2(rect.width(), 58.0));
+    cp.rect_filled(header, CornerRadius::ZERO, theme::black(0.22));
+    icons::glyph_back(&cp, pos2(rect.left() + 28.0, top + 29.0), 20.0, theme::white(0.9));
+    label(
+        &cp,
+        pos2(rect.center().x, top + 29.0),
+        Align2::CENTER_CENTER,
+        o.app.name(),
+        theme::font_medium(17.0),
+        Color32::WHITE,
+        false,
+    );
+    icons::dots3v(&cp, pos2(rect.right() - 30.0, top + 29.0), 6.5, 2.1, theme::white(0.8));
+    hits.push((
+        Rect::from_min_size(pos2(rect.left(), top), vec2(62.0, 58.0)),
+        Hit::AppBack,
+    ));
+    hits.push((
+        Rect::from_min_size(pos2(rect.right() - 62.0, top), vec2(62.0, 58.0)),
+        Hit::AppAction(0),
+    ));
+
+    let c = Rect::from_min_max(
+        pos2(rect.left(), header.bottom()),
+        pos2(rect.right(), rect.bottom() - 26.0),
+    );
+    match o.app {
+        App::Chrome | App::Google | App::Duo | App::GooglePay | App::Gmail => {
+            browser_mock(&cp, c, accent);
+        }
+        App::Messages | App::Forums => chat_mock(&cp, c, accent, o.app),
+        App::Camera => camera_mock(&cp, c, hits),
+        App::Gallery | App::Photos => gallery_mock(&cp, c),
+        App::PlayStore | App::PlayMovies => store_mock(&cp, c, hits),
+        App::Music | App::PlayMusic | App::Recorder => music_mock(&cp, c, accent, hits),
+        App::Weather => weather_mock(&cp, c, accent, hits),
+        App::Clock => clock_mock(&cp, c, app),
+        App::Calculator => calc_mock(&cp, c, hits),
+        App::Maps => maps_mock(&cp, c, accent),
+        App::YouTube | App::Netflix => video_mock(&cp, c, accent),
+        _ => skeleton_mock(&cp, c, accent),
+    }
+
+    label(
+        &cp,
+        pos2(rect.center().x, rect.bottom() - 13.0),
+        Align2::CENTER_CENTER,
+        "Demo preview - back: chevron or left-edge swipe",
+        theme::font(10.5),
+        theme::white(0.35),
+        false,
+    );
+}
+
+fn browser_mock(p: &Painter, c: Rect, accent: Color32) {
+    let f = Rect::from_min_size(
+        pos2(c.left() + 20.0, c.top() + 18.0),
+        vec2(c.width() - 40.0, 40.0),
+    );
+    icons::rrect(p, f, 20.0, theme::white(0.10));
+    p.circle_filled(pos2(f.left() + 22.0, f.center().y), 3.5, accent);
+    label(
+        p,
+        pos2(f.left() + 36.0, f.center().y),
+        Align2::LEFT_CENTER,
+        "google.com/search",
+        theme::font(13.5),
+        theme::white(0.85),
+        false,
+    );
+    for i in 0..3 {
+        let y = c.top() + 78.0 + i as f32 * 74.0;
+        icons::disc(p, pos2(c.left() + 40.0, y + 14.0), 14.0, theme::with_alpha(accent, 0.85));
+        bar(p, c.left() + 64.0, y + 2.0, c.width() * 0.55, 9.0, theme::white(0.16));
+        bar(p, c.left() + 64.0, y + 18.0, c.width() * 0.40, 7.0, theme::white(0.10));
+        bar(p, c.left() + 64.0, y + 32.0, c.width() * 0.30, 7.0, theme::with_alpha(accent, 0.5));
+    }
+}
+
+fn chat_mock(p: &Painter, c: Rect, accent: Color32, app: App) {
+    label(
+        p,
+        pos2(c.left() + 24.0, c.top() + 16.0),
+        Align2::LEFT_CENTER,
+        if app == App::Forums { "OnePlus Forums" } else { "Aarav" },
+        theme::font_medium(14.0),
+        theme::white(0.9),
+        false,
+    );
+    let bubbles: [(bool, f32, &str); 5] = [
+        (false, 0.50, "Did you try the new build?"),
+        (true, 0.46, "Running it now - feels stock"),
+        (false, 0.56, "Cards update via postCard()"),
+        (true, 0.40, "Hidden Space works too"),
+        (false, 0.44, "Unhide me from there :)"),
+    ];
+    let mut y = c.top() + 42.0;
+    for (out, wf, txt) in bubbles {
+        let w = c.width() * wf;
+        let r = Rect::from_min_size(
+            pos2(
+                if out { c.right() - 20.0 - w } else { c.left() + 20.0 },
+                y,
+            ),
+            vec2(w, 44.0),
+        );
+        icons::rrect(
+            p,
+            r,
+            16.0,
+            if out {
+                theme::with_alpha(accent, 0.85)
+            } else {
+                theme::white(0.12)
+            },
+        );
+        label(p, r.center(), Align2::CENTER_CENTER, txt, theme::font(11.5), Color32::WHITE, false);
+        y += 56.0;
+    }
+    let _ = y;
+    let inp = Rect::from_min_size(
+        pos2(c.left() + 20.0, c.bottom() - 30.0),
+        vec2(c.width() - 40.0, 44.0),
+    );
+    icons::rrect(p, inp, 22.0, theme::white(0.10));
+    label(
+        p,
+        pos2(inp.left() + 18.0, inp.center().y),
+        Align2::LEFT_CENTER,
+        "Message",
+        theme::font(13.0),
+        theme::white(0.5),
+        false,
+    );
+    icons::glyph_play(
+        p,
+        pos2(inp.right() - 24.0, inp.center().y),
+        14.0,
+        theme::with_alpha(accent, 0.9),
+    );
+}
+
+fn camera_mock(p: &Painter, c: Rect, hits: &mut Vec<(Rect, Hit)>) {
+    icons::rrect(p, c, 0.0, theme::rgb(0x05070A));
+    // Viewfinder corner brackets.
+    let b = 34.0;
+    for (px, py, sx, sy) in [
+        (c.left() + 28.0, c.top() + 28.0, 1.0, 1.0),
+        (c.right() - 28.0, c.top() + 28.0, -1.0, 1.0),
+        (c.left() + 28.0, c.bottom() - 96.0, 1.0, -1.0),
+        (c.right() - 28.0, c.bottom() - 96.0, -1.0, -1.0),
+    ] {
+        let o = pos2(px, py);
+        icons::line(p, o, o + vec2(b * sx, 0.0), 2.5, theme::white(0.6));
+        icons::line(p, o, o + vec2(0.0, b * sy), 2.5, theme::white(0.6));
+    }
+    // Focus square.
+    let fs = Rect::from_center_size(
+        pos2(c.center().x, c.center().y - 40.0),
+        vec2(96.0, 96.0),
+    );
+    let fb = 16.0;
+    for (px, py, sx, sy) in [
+        (fs.left(), fs.top(), 1.0, 1.0),
+        (fs.right(), fs.top(), -1.0, 1.0),
+        (fs.left(), fs.bottom(), 1.0, -1.0),
+        (fs.right(), fs.bottom(), -1.0, -1.0),
+    ] {
+        let o = pos2(px, py);
+        icons::line(p, o, o + vec2(fb * sx, 0.0), 2.0, theme::rgb(0xEB0029));
+        icons::line(p, o, o + vec2(0.0, fb * sy), 2.0, theme::rgb(0xEB0029));
+    }
+    // Mode strip.
+    label(
+        p,
+        pos2(c.center().x, c.bottom() - 132.0),
+        Align2::CENTER_CENTER,
+        "VIDEO     PORTRAIT     PHOTO",
+        theme::font_medium(11.0),
+        theme::white(0.8),
+        false,
+    );
+    // Shutter + flip.
+    let sc = pos2(c.center().x, c.bottom() - 70.0);
+    icons::glyph_shutter(p, sc, 30.0, Color32::WHITE);
+    hits.push((Rect::from_center_size(sc, vec2(84.0, 84.0)), Hit::AppAction(0)));
+    let fc = pos2(c.right() - 64.0, c.bottom() - 70.0);
+    p.circle_filled(fc, 20.0, theme::white(0.12));
+    icons::glyph_rotate(p, fc, 22.0, theme::white(0.85));
+    hits.push((Rect::from_center_size(fc, vec2(64.0, 64.0)), Hit::AppAction(1)));
+}
+
+fn gallery_mock(p: &Painter, c: Rect) {
+    label(
+        p,
+        pos2(c.left() + 24.0, c.top() + 18.0),
+        Align2::LEFT_CENTER,
+        "Today",
+        theme::font_medium(15.0),
+        theme::white(0.9),
+        false,
+    );
+    const HUE: [u32; 12] = [
+        0x2E5C8A, 0x8A4B2E, 0x3E7A52, 0x8A2E4C, 0x5C6672, 0x2E8A82, 0x7A6A2E, 0x4C2E8A,
+        0x8A7A2E, 0x2E4C8A, 0x6A2E8A, 0x2E8A4C,
+    ];
+    let top = c.top() + 40.0;
+    let gap = 6.0;
+    let tw = (c.width() - 40.0 - gap * 2.0) / 3.0;
+    let th = tw * 1.12;
+    for i in 0..12 {
+        let col = i % 3;
+        let row = i / 3;
+        let tr = Rect::from_min_size(
+            pos2(
+                c.left() + 20.0 + col as f32 * (tw + gap),
+                top + row as f32 * (th + gap),
+            ),
+            vec2(tw, th),
+        );
+        if tr.bottom() > c.bottom() - 10.0 {
+            break;
+        }
+        icons::rrect(p, tr, 8.0, theme::rgb(HUE[i]));
+        p.circle_filled(
+            pos2(tr.right() - 14.0, tr.top() + 14.0),
+            6.0,
+            theme::white(0.25),
+        );
+    }
+}
+
+fn store_mock(p: &Painter, c: Rect, hits: &mut Vec<(Rect, Hit)>) {
+    label(
+        p,
+        pos2(c.left() + 24.0, c.top() + 18.0),
+        Align2::LEFT_CENTER,
+        "Recommended for you",
+        theme::font_medium(15.0),
+        theme::white(0.9),
+        false,
+    );
+    const NAMES: [&str; 3] = ["Launcher Lab", "Retro Notes", "Cloud Sync"];
+    for i in 0..3 {
+        let y = c.top() + 48.0 + i as f32 * 84.0;
+        icons::disc(p, pos2(c.left() + 44.0, y + 26.0), 17.0, theme::white(0.14));
+        label(
+            p,
+            pos2(c.left() + 44.0, y + 26.0),
+            Align2::CENTER_CENTER,
+            &format!("{}", i + 1),
+            theme::font_medium(13.0),
+            theme::white(0.8),
+            false,
+        );
+        label(
+            p,
+            pos2(c.left() + 74.0, y + 16.0),
+            Align2::LEFT_CENTER,
+            NAMES[i],
+            theme::font_medium(14.0),
+            theme::white(0.95),
+            false,
+        );
+        bar(p, c.left() + 74.0, y + 34.0, c.width() * 0.38, 7.0, theme::white(0.10));
+        let pill = Rect::from_center_size(pos2(c.right() - 66.0, y + 26.0), vec2(84.0, 34.0));
+        icons::rrect(p, pill, 17.0, theme::rgb(0x1F9C6C));
+        label(
+            p,
+            pill.center(),
+            Align2::CENTER_CENTER,
+            "Install",
+            theme::font_medium(12.5),
+            Color32::WHITE,
+            false,
+        );
+        hits.push((pill, Hit::AppAction(1 + i)));
+    }
+}
+
+fn music_mock(p: &Painter, c: Rect, accent: Color32, hits: &mut Vec<(Rect, Hit)>) {
+    let size = (c.width() - 96.0).clamp(140.0, 220.0);
+    let art = Rect::from_center_size(
+        pos2(c.center().x, c.top() + 38.0 + size * 0.5),
+        vec2(size, size),
+    );
+    icons::rrect(p, art, 18.0, theme::with_alpha(accent, 0.92));
+    icons::rrect(p, art.shrink(size * 0.22), 12.0, theme::black(0.25));
+    p.circle_filled(art.center(), size * 0.10, theme::white(0.9));
+    p.circle_filled(art.center(), size * 0.045, theme::rgb(0x111111));
+    label(
+        p,
+        pos2(c.center().x, art.bottom() + 28.0),
+        Align2::CENTER_CENTER,
+        "Reconstruction EP",
+        theme::font_medium(16.0),
+        Color32::WHITE,
+        false,
+    );
+    label(
+        p,
+        pos2(c.center().x, art.bottom() + 50.0),
+        Align2::CENTER_CENTER,
+        "rajbhx",
+        theme::font(12.5),
+        theme::white(0.6),
+        false,
+    );
+    let seek = Rect::from_min_size(
+        pos2(c.left() + 36.0, art.bottom() + 74.0),
+        vec2(c.width() - 72.0, 5.0),
+    );
+    icons::rrect(p, seek, 2.5, theme::white(0.15));
+    icons::rrect(
+        p,
+        Rect::from_min_max(seek.min, pos2(seek.left() + seek.width() * 0.35, seek.max)),
+        2.5,
+        theme::with_alpha(accent, 0.95),
+    );
+    p.circle_filled(
+        pos2(seek.left() + seek.width() * 0.35, seek.center().y),
+        7.0,
+        Color32::WHITE,
+    );
+    let cc = pos2(c.center().x, seek.bottom() + 52.0);
+    icons::glyph_skip(p, pos2(cc.x - 86.0, cc.y), 24.0, theme::white(0.85), true);
+    p.circle_filled(cc, 30.0, theme::with_alpha(accent, 0.95));
+    icons::glyph_pause(p, cc, 22.0, Color32::WHITE);
+    hits.push((Rect::from_center_size(cc, vec2(80.0, 80.0)), Hit::AppAction(1)));
+    icons::glyph_skip(p, pos2(cc.x + 86.0, cc.y), 24.0, theme::white(0.85), false);
+}
+
+fn weather_mock(p: &Painter, c: Rect, accent: Color32, hits: &mut Vec<(Rect, Hit)>) {
+    label(
+        p,
+        pos2(c.left() + 28.0, c.top() + 40.0),
+        Align2::LEFT_CENTER,
+        "84\u{00B0}",
+        theme::font_light(64.0),
+        Color32::WHITE,
+        false,
+    );
+    label(
+        p,
+        pos2(c.left() + 30.0, c.top() + 92.0),
+        Align2::LEFT_CENTER,
+        "CLOUDY",
+        theme::font_medium(13.0),
+        theme::with_alpha(accent, 0.95),
+        false,
+    );
+    label(
+        p,
+        pos2(c.left() + 30.0, c.top() + 114.0),
+        Align2::LEFT_CENTER,
+        "Cloudy with sunny intervals",
+        theme::font(12.5),
+        theme::white(0.6),
+        false,
+    );
+    let days = ["MON", "TUE", "WED", "THU", "FRI"];
+    let temps = ["84/71", "83/70", "85/72", "82/69", "81/68"];
+    let col_w = (c.width() - 48.0) / 5.0;
+    for i in 0..5 {
+        let cx = c.left() + 24.0 + col_w * (i as f32 + 0.5);
+        let y = c.top() + 170.0;
+        label(
+            p,
+            pos2(cx, y),
+            Align2::CENTER_CENTER,
+            days[i],
+            theme::font_medium(11.0),
+            theme::white(0.55),
+            false,
+        );
+        label(
+            p,
+            pos2(cx, y + 24.0),
+            Align2::CENTER_CENTER,
+            temps[i],
+            theme::font(13.0),
+            theme::white(0.9),
+            false,
+        );
+    }
+    let card = Rect::from_min_size(
+        pos2(c.left() + 24.0, c.top() + 226.0),
+        vec2(c.width() - 48.0, 124.0),
+    );
+    icons::rrect(p, card, 18.0, theme::white(0.06));
+    label(
+        p,
+        pos2(card.left() + 18.0, card.top() + 22.0),
+        Align2::LEFT_CENTER,
+        "Feels like 86\u{00B0}",
+        theme::font_medium(14.0),
+        theme::white(0.9),
+        false,
+    );
+    label(
+        p,
+        pos2(card.left() + 18.0, card.top() + 46.0),
+        Align2::LEFT_CENTER,
+        "Humidity 62%  -  Wind 9 km/h",
+        theme::font(12.5),
+        theme::white(0.6),
+        false,
+    );
+    label(
+        p,
+        pos2(card.left() + 18.0, card.top() + 70.0),
+        Align2::LEFT_CENTER,
+        "Sunrise 06:12  -  Sunset 18:44",
+        theme::font(12.5),
+        theme::white(0.6),
+        false,
+    );
+    label(
+        p,
+        pos2(card.left() + 18.0, card.top() + 96.0),
+        Align2::LEFT_CENTER,
+        "Tap to refresh (getCard weather.today)",
+        theme::font(11.5),
+        theme::with_alpha(accent, 0.9),
+        false,
+    );
+    hits.push((card, Hit::AppAction(2)));
+}
+
+fn clock_mock(p: &Painter, c: Rect, app: &LauncherLab) {
+    label(
+        p,
+        pos2(c.center().x, c.top() + 110.0),
+        Align2::CENTER_CENTER,
+        &clock::clock_label(app.time),
+        theme::font_light(72.0),
+        Color32::WHITE,
+        false,
+    );
+    label(
+        p,
+        pos2(c.center().x, c.top() + 166.0),
+        Align2::CENTER_CENTER,
+        &clock::date_label(app.time),
+        theme::font(14.0),
+        theme::white(0.65),
+        false,
+    );
+    let rows = [
+        ("London", "08:04", "+5h"),
+        ("New York", "03:04", "-4h"),
+        ("Tokyo", "16:04", "+13h"),
+    ];
+    let mut y = c.top() + 236.0;
+    for (city, t, off) in rows {
+        label(
+            p,
+            pos2(c.left() + 28.0, y),
+            Align2::LEFT_CENTER,
+            city,
+            theme::font_medium(14.0),
+            theme::white(0.9),
+            false,
+        );
+        label(
+            p,
+            pos2(c.right() - 76.0, y),
+            Align2::RIGHT_CENTER,
+            off,
+            theme::font(12.0),
+            theme::white(0.45),
+            false,
+        );
+        label(
+            p,
+            pos2(c.right() - 28.0, y),
+            Align2::RIGHT_CENTER,
+            t,
+            theme::font(20.0),
+            theme::white(0.9),
+            false,
+        );
+        bar(p, c.left() + 28.0, y + 22.0, c.width() - 56.0, 1.0, theme::white(0.08));
+        y += 64.0;
+    }
+}
+
+fn calc_mock(p: &Painter, c: Rect, hits: &mut Vec<(Rect, Hit)>) {
+    label(
+        p,
+        pos2(c.right() - 28.0, c.top() + 80.0),
+        Align2::RIGHT_CENTER,
+        "0",
+        theme::font_light(56.0),
+        Color32::WHITE,
+        false,
+    );
+    label(
+        p,
+        pos2(c.right() - 30.0, c.top() + 122.0),
+        Align2::RIGHT_CENTER,
+        "demo display",
+        theme::font(11.0),
+        theme::white(0.4),
+        false,
+    );
+    let keys: [[&str; 4]; 5] = [
+        ["AC", "()", "%", "\u{00F7}"],
+        ["7", "8", "9", "\u{00D7}"],
+        ["4", "5", "6", "-"],
+        ["1", "2", "3", "+"],
+        ["0", ".", "=", ""],
+    ];
+    let gap = 10.0;
+    let kw = (c.width() - 48.0 - gap * 3.0) / 4.0;
+    let kh = (kw * 0.82).min(64.0);
+    let x0 = c.left() + 24.0;
+    let grid_top = c.bottom() - 5.0 * (kh + gap) - 8.0;
+    for r in 0..5 {
+        for col in 0..4 {
+            let key = keys[r][col];
+            if key.is_empty() {
+                continue;
+            }
+            let kr = Rect::from_min_size(
+                pos2(x0 + col as f32 * (kw + gap), grid_top + r as f32 * (kh + gap)),
+                vec2(kw, kh),
+            );
+            let op = r == 0 || col == 3 || (r == 4 && col == 2);
+            icons::rrect(
+                p,
+                kr,
+                kh * 0.5,
+                if op {
+                    theme::with_alpha(theme::rgb(0xFF7A1A), 0.20)
+                } else {
+                    theme::white(0.09)
+                },
+            );
+            label(
+                p,
+                kr.center(),
+                Align2::CENTER_CENTER,
+                key,
+                theme::font_medium(19.0),
+                if op {
+                    theme::rgb(0xFF9A4A)
+                } else {
+                    Color32::WHITE
+                },
+                false,
+            );
+            let idx = r * 4 + col;
+            hits.push((kr, Hit::AppAction(10 + idx)));
+        }
+    }
+}
+
+fn maps_mock(p: &Painter, c: Rect, accent: Color32) {
+    for i in 0..7 {
+        let y = c.top() + 40.0 + i as f32 * 74.0;
+        bar(p, c.left(), y, c.width(), 8.0, theme::white(0.05));
+    }
+    for i in 0..5 {
+        let x = c.left() + 30.0 + i as f32 * 92.0;
+        icons::rrect(
+            p,
+            Rect::from_min_size(pos2(x, c.top() + 30.0), vec2(8.0, c.height() - 60.0)),
+            4.0,
+            theme::white(0.05),
+        );
+    }
+    let route = [
+        pos2(c.left() + 60.0, c.bottom() - 120.0),
+        pos2(c.left() + 60.0, c.top() + 260.0),
+        pos2(c.center().x + 40.0, c.top() + 260.0),
+        pos2(c.center().x + 40.0, c.top() + 150.0),
+    ];
+    icons::pline(p, &route, 6.0, theme::with_alpha(accent, 0.85));
+    icons::glyph_pin(
+        p,
+        pos2(c.center().x + 40.0, c.top() + 138.0),
+        22.0,
+        theme::rgb(0xEA4335),
+    );
+    let f = Rect::from_min_size(
+        pos2(c.left() + 20.0, c.top() + 16.0),
+        vec2(c.width() - 40.0, 42.0),
+    );
+    icons::rrect(p, f, 21.0, theme::white(0.10));
+    icons::glyph_magnifier(p, pos2(f.left() + 24.0, f.center().y), 18.0, theme::white(0.6));
+    label(
+        p,
+        pos2(f.left() + 44.0, f.center().y),
+        Align2::LEFT_CENTER,
+        "Coffee nearby",
+        theme::font(13.5),
+        theme::white(0.8),
+        false,
+    );
+}
+
+fn video_mock(p: &Painter, c: Rect, accent: Color32) {
+    const TITLES: [&str; 2] = ["OnePlus Launcher teardown", "I built a launcher in Rust"];
+    for i in 0..2 {
+        let y = c.top() + 26.0 + i as f32 * 230.0;
+        let thumb = Rect::from_min_size(
+            pos2(c.left() + 16.0, y),
+            vec2(c.width() - 32.0, (c.width() - 32.0) * 0.5625),
+        );
+        icons::rrect(p, thumb, 12.0, theme::with_alpha(accent, 0.35));
+        p.circle_filled(thumb.center(), 26.0, theme::black(0.45));
+        icons::glyph_play(p, thumb.center() + vec2(2.0, 0.0), 22.0, Color32::WHITE);
+        label(
+            p,
+            pos2(c.left() + 18.0, thumb.bottom() + 20.0),
+            Align2::LEFT_CENTER,
+            TITLES[i],
+            theme::font_medium(14.0),
+            theme::white(0.9),
+            false,
+        );
+        bar(p, c.left() + 18.0, thumb.bottom() + 34.0, c.width() * 0.45, 7.0, theme::white(0.10));
+    }
+}
+
+fn skeleton_mock(p: &Painter, c: Rect, accent: Color32) {
+    for i in 0..5 {
+        let y = c.top() + 30.0 + i as f32 * 72.0;
+        icons::disc(p, pos2(c.left() + 46.0, y + 22.0), 18.0, theme::with_alpha(accent, 0.85));
+        bar(p, c.left() + 78.0, y + 10.0, c.width() * 0.48, 10.0, theme::white(0.14));
+        bar(p, c.left() + 78.0, y + 28.0, c.width() * 0.34, 8.0, theme::white(0.08));
+        icons::glyph_chev(p, pos2(c.right() - 30.0, y + 22.0), 18.0, theme::white(0.35));
+        bar(p, c.left() + 20.0, y + 58.0, c.width() - 40.0, 1.0, theme::white(0.06));
+    }
+}
+
+// -------------------------------------------------------------- onboarding
+
+fn draw_onboarding(p: &Painter, rect: Rect, hits: &mut Vec<(Rect, Hit)>, pal: &Palette) {
+    p.rect_filled(rect, CornerRadius::ZERO, theme::black(0.78));
+    let card_h = (rect.height() - 160.0).min(560.0);
+    let card = Rect::from_center_size(
+        pos2(rect.center().x, rect.top() + 60.0 + card_h * 0.5),
+        vec2(rect.width() - 44.0, card_h),
+    );
+    icons::rrect(p, card.translate(vec2(0.0, 6.0)), 24.0, theme::black(0.5));
+    icons::rrect(p, card, 24.0, pal.panel);
+    label(
+        p,
+        pos2(card.center().x, card.top() + 34.0),
+        Align2::CENTER_CENTER,
+        "LAUNCHER LAB",
+        theme::font_medium(16.0),
+        theme::with_alpha(pal.accent, 0.95),
+        false,
+    );
+    label(
+        p,
+        pos2(card.center().x, card.top() + 58.0),
+        Align2::CENTER_CENTER,
+        "OnePlus Launcher 4.4.8 as a pure-Rust reconstruction",
+        theme::font(11.5),
+        theme::with_alpha(pal.text, 0.6),
+        false,
+    );
+    const ROWS: [&str; 8] = [
+        "Swipe up: app drawer with all apps",
+        "Swipe up from the bottom edge: recents",
+        "Swipe down from the status bar: notification shade",
+        "Swipe right on page 1 or the left edge: Shelf",
+        "In the drawer, swipe right: Hidden Space",
+        "Hold an app in the drawer: hide it",
+        "Hold empty home: light / dark chrome",
+        "Double-tap empty home: lock screen",
+    ];
+    let mut y = card.top() + 92.0;
+    for row in ROWS {
+        p.circle_filled(
+            pos2(card.left() + 30.0, y),
+            3.2,
+            theme::with_alpha(pal.accent, 0.9),
+        );
+        label(
+            p,
+            pos2(card.left() + 46.0, y),
+            Align2::LEFT_CENTER,
+            row,
+            theme::font(12.5),
+            theme::with_alpha(pal.text, 0.88),
+            false,
+        );
+        y += 34.0;
+    }
+    let btn = Rect::from_center_size(pos2(card.center().x, y + 30.0), vec2(180.0, 46.0));
+    icons::rrect(p, btn, 23.0, theme::with_alpha(pal.accent, 0.95));
+    label(
+        p,
+        btn.center(),
+        Align2::CENTER_CENTER,
+        "Got it",
+        theme::font_medium(15.0),
+        Color32::WHITE,
+        false,
+    );
+    hits.push((card, Hit::OnboardOk));
+    hits.push((btn, Hit::OnboardOk));
 }

@@ -52,8 +52,9 @@ const CLOUDS: &[Cloud] = &[
     Cloud { cx: 0.05, cy: 0.94, r: 0.30, rgb: 0x0A0E26, a: 0.22, seed: 10 },
 ];
 
-/// Paint the wallpaper into `rect`.
-pub fn paint(p: &Painter, rect: Rect) {
+/// Paint the wallpaper into `rect`. `parallax` is the live home-pager offset
+/// (px); the clouds slide at a fraction of it, like the stock launcher.
+pub fn paint(p: &Painter, rect: Rect, parallax: f32) {
     // Base: vertical gradient indigo -> near-black navy.
     const STEPS: usize = 48;
     let top = theme::rgb(0x171E3E);
@@ -75,7 +76,10 @@ pub fn paint(p: &Painter, rect: Rect) {
     let h = rect.height().max(1.0);
 
     for cloud in CLOUDS {
-        let c = pos2(rect.left() + cloud.cx * w, rect.top() + cloud.cy * h);
+        let c = pos2(
+            rect.left() + cloud.cx * w - parallax * 0.30,
+            rect.top() + cloud.cy * h,
+        );
         let r = cloud.r * w;
         let mut rng = Rng::new(cloud.seed);
         let base = theme::rgb(cloud.rgb);
