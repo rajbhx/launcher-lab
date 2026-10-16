@@ -88,7 +88,10 @@ jobs:
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
           CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/launcher-lab-release.keystore
           CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.LAUNCHER_LAB_KEYSTORE_PASSWORD }}
-        run: cargo apk build --release
+        # --lib: build only the cdylib artifact. Without it cargo-apk also tries
+        # to package the desktop bin target and panics ("Bin is not compatible
+        # with Cdylib") when resolving its library path.
+        run: cargo apk build --release --lib
 
       - name: Locate and verify APK
         run: |

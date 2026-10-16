@@ -84,7 +84,7 @@ Two workflows, zero local builds:
 * **`.github/workflows/android.yml`** — the APK pipeline:
   1. JDK 17, Android SDK (platform 34, build-tools 33.0.2), NDK **r26d**
   2. Rust stable + `aarch64-linux-android` target, `cargo install cargo-apk`
-  3. `cargo apk build --release`
+  3. `cargo apk build --release --lib`
   4. verifies the APK with `aapt2 dump badging` + `apksigner verify`
   5. uploads it as a workflow artifact and refreshes the `apk-latest` release
 
