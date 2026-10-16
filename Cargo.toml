@@ -1,0 +1,45 @@
+[package]
+name = "launcher-lab"
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.81"
+authors = ["rajbhx"]
+license = "MIT"
+description = "Gesture-first launcher prototype for Android in pure Rust (egui/eframe), reconstructed from a static REA analysis of OnePlus Launcher 4.4.8"
+repository = "https://github.com/rajbhx/launcher-lab"
+publish = false
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+[dependencies]
+eframe = { version = "0.31", features = ["android-native-activity"] }
+log = "0.4"
+
+[target.'cfg(target_os = "android")'.dependencies]
+android_logger = "0.14"
+winit = { version = "0.30", default-features = false }
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+strip = "symbols"
+
+[package.metadata.android]
+package = "dev.rajbhx.launcherlab"
+apk_name = "launcher-lab"
+build_targets = ["aarch64-linux-android"]
+resources = "res"
+
+[package.metadata.android.sdk]
+min_sdk_version = 29
+target_sdk_version = 34
+
+[package.metadata.android.application]
+label = "Launcher Lab"
+icon = "@mipmap/ic_launcher"
+theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
+
+[package.metadata.android.application.activity]
+orientation = "portrait"

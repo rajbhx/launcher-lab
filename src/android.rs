@@ -1,0 +1,29 @@
+//! Android entry point (NativeActivity backend, packaged by `cargo apk`).
+//!
+//! This module is compiled only for `target_os = "android"`. The
+//! `android_main` symbol below is the entry point that `android-activity`
+//! invokes once the NativeActivity is created.
+
+use winit::platform::android::activity::AndroidApp;
+
+use crate::LauncherLab;
+
+#[no_mangle]
+fn android_main(app: AndroidApp) {
+    android_logger::init_once(
+        android_logger::Config::default().with_max_level(log::LevelFilter::Info),
+    );
+
+    let options = eframe::NativeOptions {
+        android_app: Some(app),
+        ..Default::default()
+    };
+
+    if let Err(err) = eframe::run_native(
+        "Launcher Lab",
+        options,
+        Box::new(|cc| Ok(Box::new(LauncherLab::new(cc)))),
+    ) {
+        log::error!("eframe failed to start: {err}");
+    }
+}

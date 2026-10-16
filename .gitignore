@@ -1,0 +1,5 @@
+/target
+*.apk
+*.aab
+.idea/
+.vscode/
