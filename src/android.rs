@@ -14,6 +14,10 @@ fn android_main(app: AndroidApp) {
         android_logger::Config::default().with_max_level(log::LevelFilter::Info),
     );
 
+    // Adopt the live JavaVM + activity context so `platform` can talk to the
+    // Android system services (PackageManager, WallpaperManager, ...).
+    crate::platform::set_android();
+
     // Explicitly request the glow (OpenGL ES) backend with vsync: on Android
     // this drives the NativeActivity's hardware-accelerated EGL surface.
     let options = eframe::NativeOptions {

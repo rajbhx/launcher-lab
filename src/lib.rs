@@ -11,6 +11,7 @@
 //! `net.oneplus.quickstep.TouchInteractionService`.
 
 pub mod model;
+pub mod platform;
 
 mod app;
 mod clock;
