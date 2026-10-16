@@ -919,6 +919,228 @@ pub fn system_wallpaper_rgba(
     })
 }
 
+/// A live snapshot of the system toggles the shade reports.
+///
+/// Every field is best-effort: `None` means the value could not be read on
+/// this device/OS version (missing permission, reserved API, ...) and the UI
+/// shows the toggle as unknown instead of inventing a state.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub struct SystemState {
+    pub wifi: Option<bool>,
+    pub bluetooth: Option<bool>,
+    pub airplane: Option<bool>,
+    pub auto_rotate: Option<bool>,
+    pub battery_saver: Option<bool>,
+}
+
+/// Read the live state of Wi-Fi, Bluetooth, airplane mode, auto-rotate and
+/// battery saver. Never fails wholesale: unreadable values come back `None`.
+pub fn read_system_states() -> Result<SystemState, PlatformError> {
+    with_activity_context(|env, context| {
+        env.with_local_frame(LOCAL_FRAME_CAPACITY, |env| {
+            let mut state = SystemState::default();
+            state.wifi = read_wifi_state(env, context);
+            state.bluetooth = read_bluetooth_state(env, context);
+            state.airplane = read_bool_setting(
+                env,
+                context,
+                "android/provider/Settings$Global",
+                "airplane_mode_on",
+            );
+            state.auto_rotate = read_bool_setting(
+                env,
+                context,
+                "android/provider/Settings$System",
+                "accelerometer_rotation",
+            );
+            state.battery_saver = read_power_saver(env, context);
+            Ok(state)
+        })
+    })
+}
+
+/// Map a shade toggle key to the system settings action it opens.
+///
+/// A normal app cannot flip Wi-Fi/Bluetooth/etc. on Android 10+, so the tiles
+/// open the real settings screens instead of faking a toggle.
+pub fn system_screen_action(key: &str) -> Option<&'static str> {
+    match key {
+        "wifi" => Some("android.settings.WIFI_SETTINGS"),
+        "bluetooth" => Some("android.settings.BLUETOOTH_SETTINGS"),
+        "airplane" => Some("android.settings.AIRPLANE_MODE_SETTINGS"),
+        "display" => Some("android.settings.DISPLAY_SETTINGS"),
+        "battery_saver" => Some("android.settings.BATTERY_SAVER_SETTINGS"),
+        _ => None,
+    }
+}
+
+/// Open one of the whitelisted system settings screens.
+pub fn open_system_screen(key: &str) -> Result<(), PlatformError> {
+    let action = system_screen_action(key).ok_or_else(|| {
+        PlatformError::InvalidComponent(format!("unknown system screen {key:?}"))
+    })?;
+    with_activity_context(|env, context| {
+        env.with_local_frame(ENTRY_FRAME_CAPACITY, |env| {
+            let action = new_string_ref(env, action)?;
+            let intent = new_object_ref(
+                env,
+                "opening a settings screen",
+                "android/content/Intent",
+                "(Ljava/lang/String;)V",
+                &[JValue::Object(&*action)],
+            )?;
+            call_void(
+                env,
+                "opening a settings screen",
+                &intent,
+                "setFlags",
+                "(I)Landroid/content/Intent;",
+                &[JValue::Int(INTENT_FLAG_NEW_TASK)],
+            )?;
+            let started = env.call_method(
+                context,
+                "startActivity",
+                "(Landroid/content/Intent;)V",
+                &[JValue::Object(&intent)],
+            );
+            match started {
+                Ok(_) => Ok(()),
+                Err(error) => {
+                    let failure = jni_fail(env, "opening a settings screen", error);
+                    log::warn!("platform: opening the {key} screen failed: {failure}");
+                    Err(PlatformError::LaunchFailed(format!(
+                        "the {key} settings screen"
+                    )))
+                }
+            }
+        })
+    })
+}
+
+/// `WifiManager.isWifiEnabled()` (`ACCESS_WIFI_STATE` is a normal permission).
+fn read_wifi_state(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> Option<bool> {
+    let service = new_string_ref(env, "wifi").ok()?;
+    let manager = call_object(
+        env,
+        "reading Wi-Fi state",
+        context,
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        &[JValue::Object(&*service)],
+    )
+    .ok()?;
+    if manager.is_null() {
+        return None;
+    }
+    match env.call_method(&manager, "isWifiEnabled", "()Z", &[]) {
+        Ok(value) => value.z().ok(),
+        Err(error) => {
+            let _ = jni_fail(env, "reading Wi-Fi state", error);
+            None
+        }
+    }
+}
+
+/// `BluetoothAdapter.getState() == STATE_ON` (legacy BLUETOOTH permission;
+/// newer devices without the runtime grant report `None`).
+fn read_bluetooth_state(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> Option<bool> {
+    let service = new_string_ref(env, "bluetooth").ok()?;
+    let manager = call_object(
+        env,
+        "reading Bluetooth state",
+        context,
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        &[JValue::Object(&*service)],
+    )
+    .ok()?;
+    if manager.is_null() {
+        return None;
+    }
+    let adapter = call_object(
+        env,
+        "reading Bluetooth state",
+        &manager,
+        "getAdapter",
+        "()Landroid/bluetooth/BluetoothAdapter;",
+        &[],
+    )
+    .ok()?;
+    if adapter.is_null() {
+        return None;
+    }
+    match env.call_method(&adapter, "getState", "()I", &[]) {
+        Ok(value) => value.i().ok().map(|state| state == 12), // STATE_ON
+        Err(error) => {
+            let _ = jni_fail(env, "reading Bluetooth state", error);
+            None
+        }
+    }
+}
+
+/// `Settings.Global/System.getInt(resolver, name, 0) != 0`.
+fn read_bool_setting(
+    env: &mut JNIEnv<'_>,
+    context: &JObject<'_>,
+    settings_class: &str,
+    name: &str,
+) -> Option<bool> {
+    let resolver = call_object(
+        env,
+        "reading a system setting",
+        context,
+        "getContentResolver",
+        "()Landroid/content/ContentResolver;",
+        &[],
+    )
+    .ok()?;
+    if resolver.is_null() {
+        return None;
+    }
+    let key = new_string_ref(env, name).ok()?;
+    let call = env.call_static_method(
+        settings_class,
+        "getInt",
+        "(Landroid/content/ContentResolver;Ljava/lang/String;I)I",
+        &[
+            JValue::Object(&resolver),
+            JValue::Object(&*key),
+            JValue::Int(0),
+        ],
+    );
+    match call {
+        Ok(value) => value.i().ok().map(|setting| setting != 0),
+        Err(error) => {
+            let _ = jni_fail(env, "reading a system setting", error);
+            None
+        }
+    }
+}
+
+/// `PowerManager.isPowerSaveMode()` (public, no permission).
+fn read_power_saver(env: &mut JNIEnv<'_>, context: &JObject<'_>) -> Option<bool> {
+    let service = new_string_ref(env, "power").ok()?;
+    let manager = call_object(
+        env,
+        "reading battery-saver state",
+        context,
+        "getSystemService",
+        "(Ljava/lang/String;)Ljava/lang/Object;",
+        &[JValue::Object(&*service)],
+    )
+    .ok()?;
+    if manager.is_null() {
+        return None;
+    }
+    match env.call_method(&manager, "isPowerSaveMode", "()Z", &[]) {
+        Ok(value) => value.z().ok(),
+        Err(error) => {
+            let _ = jni_fail(env, "reading battery-saver state", error);
+            None
+        }
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Validation and pure helpers (host-testable)
 // ---------------------------------------------------------------------------
@@ -1254,6 +1476,34 @@ mod tests {
         assert!(matches!(
             system_wallpaper_rgba(1080, 2340),
             Err(PlatformError::Unsupported)
+        ));
+        assert!(matches!(
+            read_system_states(),
+            Err(PlatformError::Unsupported)
+        ));
+        assert!(matches!(
+            open_system_screen("wifi"),
+            Err(PlatformError::Unsupported)
+        ));
+    }
+
+    #[test]
+    fn system_screen_whitelist() {
+        assert_eq!(
+            system_screen_action("wifi"),
+            Some("android.settings.WIFI_SETTINGS")
+        );
+        assert_eq!(
+            system_screen_action("battery_saver"),
+            Some("android.settings.BATTERY_SAVER_SETTINGS")
+        );
+        for unknown in ["", "flashlight", "arbitrary.action", "wifi " ] {
+            assert!(system_screen_action(unknown).is_none(), "{unknown:?} accepted");
+        }
+        // Unknown keys are rejected before any JNI work happens.
+        assert!(matches!(
+            open_system_screen("not-a-screen"),
+            Err(PlatformError::InvalidComponent(_))
         ));
     }
 }

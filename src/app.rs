@@ -3,7 +3,23 @@
 //! Touches are routed through [`crate::model::state`] (the reconstructed
 //! input-consumer state machine); rendering lives in [`crate::views`].
 //!
-//! Gesture map (see README):
+//! ## Real device data
+//!
+//! On Android every user-visible listing is backed by the phone itself:
+//!
+//! * the drawer is filled from [`crate::platform::query_launcher_apps`],
+//! * every tap launches the real component via [`crate::platform::launch_app`],
+//! * icons and the wallpaper stream in as textures through [`crate::loader`],
+//! * the shade's quick tiles read the live system state and open the real
+//!   settings screens (a normal app cannot flip those radios on Android 10+),
+//! * Hidden Space stores real hidden packages, not catalog names.
+//!
+//! The desktop dev build (no Android) keeps the bundled demo surfaces so the
+//! UI can be worked on without a device; those paths are all behind
+//! [`crate::platform::is_android`].
+//!
+//! ## Gesture map (see README)
+//!
 //! * swipe left/right on home          -> next/previous page
 //! * swipe right from the left edge   -> Shelf (slides in from the left)
 //! * swipe up in the middle           -> app drawer
@@ -13,25 +29,42 @@
 //! * recents: swipe up on a card dismisses it, drag across = carousel
 //! * shelf: swipe left closes; tap cards = getCard; hold a memo = deleteCard
 //! * hold empty home = light/dark chrome; double-tap empty home = lock demo
-//! * swipe down from the status bar   -> notification shade (tiles/brightness/notifs)
-//! * tap any app                     -> in-app demo preview (reveal animation)
+//! * swipe down from the status bar   -> notification shade (tiles/brightness)
+//! * tap any app                     -> launches the real app (device) or the
+//!                                      in-app preview (desktop demo)
 //! * hold an app in the drawer       -> hide it; hold it in Hidden Space to restore
+
+use std::collections::{HashMap, VecDeque};
 
 use eframe::egui::{self, Color32, Context, Pos2, Rect, Vec2};
 
 use crate::clock;
 use crate::icons::{self, App};
-use crate::model::hidden::HiddenSpace;
+use crate::loader::{Loader, Reply, Request};
+use crate::model::hidden::{merge_hidden, HiddenEntry, HiddenReal, HiddenSpace};
 use crate::model::pager::Pager;
 use crate::model::shelf::{CardManager, DeleteCardResult};
 use crate::model::state::{self, ConsumerType, GestureOrigin, ReleaseOutcome, Screen, Zones};
+use crate::platform::{self, ImageRgba, PlatformError, RealApp, SystemState};
+use crate::targets;
 use crate::theme;
 use crate::views::{self, Hit};
 
-/// One entry of the (fake) recents stack.
+/// Icon edge (physical pixels) requested for real app icons.
+const ICON_TEXTURE_EDGE: u32 = 144;
+/// Loader replies converted to textures per frame (keeps frames smooth).
+const LOADER_REPLIES_PER_FRAME: usize = 6;
+/// Retry cadence for the installed-apps query while it keeps failing.
+const APPS_RETRY_SECONDS: f64 = 6.0;
+
+/// One entry of the recents stack.
 #[derive(Clone, Debug)]
 pub struct Task {
-    pub app: App,
+    /// Reconstructed painter for this app, when one exists.
+    pub mock: Option<App>,
+    /// Real package/activity once the app was actually launched.
+    pub package: Option<String>,
+    pub activity: Option<String>,
     pub title: String,
     pub caption: String,
     pub accent: u32,
@@ -52,12 +85,58 @@ pub struct Notif {
 }
 
 /// Full-screen demo preview of a "launched" app; `t` drives the reveal that
-/// grows out of the tapped icon (`src`).
+/// grows out of the tapped icon (`src`). Desktop preview only.
 #[derive(Clone, Debug)]
 pub struct OpenApp {
     pub app: App,
     pub t: f32,
     pub src: Rect,
+}
+
+/// A drawer row backed by a real installed app.
+#[derive(Clone, Debug)]
+pub struct DrawerEntry {
+    pub package: String,
+    pub activity: String,
+    pub label: String,
+    /// Reconstructed painter used until the real icon texture arrives.
+    pub mock: Option<App>,
+}
+
+/// What the drawer listing currently is.
+#[derive(Clone, Debug)]
+pub enum DrawerState {
+    /// The device query is in flight (a retry timer may be armed).
+    Loading,
+    /// [`LauncherLab::drawer`] is authoritative.
+    Ready,
+    /// The last query failed; the string is user-facing.
+    Failed(String),
+}
+
+/// Icon texture lifecycle for one package.
+pub enum IconSlot {
+    /// Requested from the loader, texture not built yet.
+    Queued,
+    Ready(egui::TextureHandle),
+    /// Decoding failed once; the drawn fallback icon is used.
+    Failed,
+}
+
+/// Drawer listing key: a demo-catalog app (desktop only) or a real package.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum DrawerKey {
+    Mock(App),
+    Real(String),
+}
+
+/// One row of the shelf's "Recent apps" section.
+#[derive(Clone, Debug)]
+pub struct ShelfRecent {
+    pub mock: Option<App>,
+    pub package: Option<String>,
+    pub activity: Option<String>,
+    pub label: String,
 }
 
 /// Info captured on touch-down (long-press targets and the hold-to-unlock pad).
@@ -66,12 +145,10 @@ struct PressInfo {
     t: f64,
     /// Memo-card tag when the press started on a shelf card.
     card: Option<String>,
-    /// Hidden-item name when the press started on a hidden-space item.
-    hidden_item: Option<String>,
+    /// Hidden-space row a long-press would restore.
+    hidden_entry: Option<HiddenEntry>,
     /// Drawer app a long-press would hide from the listing.
-    hide_app: Option<App>,
-    /// Hidden-space app a long-press would restore to the drawer.
-    hidden_app: Option<App>,
+    hide_key: Option<DrawerKey>,
     /// Press started on a long-pressable menu glyph (⋮).
     menu: bool,
     /// Press started on plain background (home, no hit).
@@ -105,7 +182,7 @@ pub struct LauncherLab {
     pub hidden: HiddenSpace,
     /// Reconstructed shelf CardProvider store.
     pub cards: CardManager,
-    /// Demo recents stack.
+    /// Recents stack (real launches on device).
     pub tasks: Vec<Task>,
     pub carousel: usize,
     pub carousel_drag: f32,
@@ -126,27 +203,52 @@ pub struct LauncherLab {
     /// Open folder as `(page, item index)` on that page.
     pub folder: Option<(usize, usize)>,
 
+    // --------------------------------------------------------- device data
+    /// Real installed launcher apps (device).
+    pub drawer: Vec<DrawerEntry>,
+    pub drawer_state: DrawerState,
+    drawer_attempt_t: f64,
+    /// Real icon textures by package.
+    pub icon_cache: HashMap<String, IconSlot>,
+    icon_error_shown: bool,
+    apps_loaded_once: bool,
+    apps_error_toasted: bool,
+    /// Resolved real components for the reconstructed home/dock entries.
+    resolved_targets: HashMap<App, RealApp>,
+    /// The live system wallpaper (device), drawn with overscan + parallax.
+    pub wallpaper_tex: Option<egui::TextureHandle>,
+    wallpaper_requested: bool,
+    loader: Option<Loader>,
+    /// Real apps hidden from the drawer.
+    pub hidden_real: Vec<HiddenReal>,
+    /// Drawer letter filter (`A`..`Z`), driven by the in-app letter panel.
+    pub search_letter: Option<char>,
+    /// Whether the letter panel is showing under the search field.
+    pub search_open: bool,
+    /// Live system toggle states shown by the shade (device).
+    pub system: SystemState,
+
     // ------------------------------------------------------------ demo bits
     /// Device-locked overlay (double-tap empty home toggles it).
     pub locked_ui: bool,
     /// `true` = dark chrome (OxygenOS 10 default), `false` = light chrome.
     pub theme_dark: bool,
     pub toast: Option<(String, f32)>,
+    toast_queue: VecDeque<String>,
     pub time: clock::TimeParts,
     /// Shade pull progress (0 closed, 1 open).
     pub shade_t: f32,
     /// Screen brightness 0.12..=1.0 (dims every surface).
     pub brightness: f32,
-    /// Quick-toggle states: Wi-Fi, Bluetooth, Flashlight, Airplane,
-    /// Auto-rotate, Battery saver.
+    /// Desktop-preview quick-toggle states (device reads `system` instead).
     pub tiles: [bool; 6],
-    /// Demo notifications shown in the shade.
+    /// Demo notifications shown in the shade (desktop preview only).
     pub notifs: Vec<Notif>,
-    /// Demo preview of the last "launched" app.
+    /// Demo preview of the last "launched" app (desktop preview only).
     pub open_app: Option<OpenApp>,
     /// First-run gesture guide.
     pub onboard: bool,
-    /// Drawer apps hidden into the Hidden Space.
+    /// Drawer apps hidden into the Hidden Space (desktop catalog).
     pub hidden_apps: Vec<App>,
     /// Monotonic input time (seconds) of the current frame.
     now: f64,
@@ -162,82 +264,67 @@ pub struct LauncherLab {
 }
 
 impl LauncherLab {
-    /// Build the launcher and seed the demo CardProvider channels.
+    /// Build the launcher; on a device this immediately starts the real
+    /// data pipeline (installed apps, then icons, then the wallpaper).
     pub fn new(cc: &eframe::CreationContext<'_>) -> Self {
         theme::install_fonts(&cc.egui_ctx);
         let mut visuals = egui::Visuals::dark();
         visuals.panel_fill = Color32::BLACK;
         cc.egui_ctx.set_visuals(visuals);
 
+        let android = platform::is_android();
+
+        // Desktop-preview seeds. On a device these surfaces start empty and
+        // fill from the phone; nothing demo is shown there.
         let mut cards = CardManager::new();
-        let _ = cards.register_channel("weather", "demo.weather");
-        let _ = cards.register_channel("health", "demo.health");
-        let _ = cards.register_channel("music", "demo.music");
+        // The memo channel exists on every platform: notes created from the
+        // shelf are stored in the reconstructed CardProvider itself.
         let _ = cards.register_channel("memo", "demo.memo");
-        let _ = cards.post_card(
-            "weather",
-            "today",
-            "Weather",
-            "Cloudy with sunny intervals. High 84\u{00B0}, low 71\u{00B0}. Light breeze from the north-west.",
-            0x17B9E8,
-        );
-        let _ = cards.post_card(
-            "music",
-            "now",
-            "Now playing",
-            "Nothing playing. Open Music to start a playlist - the shelf card updates through postCard().",
-            0xE8452C,
-        );
-        let _ = cards.post_card(
-            "health",
-            "steps",
-            "Steps",
-            "6,204 steps today. Goal 8,000 - 1,796 to go. Card posted by the Health channel.",
-            0x1F9C6C,
-        );
+        let mut notifs: Vec<Notif> = Vec::new();
+        let mut tasks: Vec<Task> = Vec::new();
+        if !android {
+            let _ = cards.register_channel("weather", "demo.weather");
+            let _ = cards.register_channel("health", "demo.health");
+            let _ = cards.register_channel("music", "demo.music");
+            let _ = cards.post_card(
+                "weather",
+                "today",
+                "Weather",
+                "Cloudy with sunny intervals. High 84\u{00B0}, low 71\u{00B0}. Light breeze from the north-west.",
+                0x17B9E8,
+            );
+            let _ = cards.post_card(
+                "music",
+                "now",
+                "Now playing",
+                "Nothing playing. Open Music to start a playlist - the shelf card updates through postCard().",
+                0xE8452C,
+            );
+            let _ = cards.post_card(
+                "health",
+                "steps",
+                "Steps",
+                "6,204 steps today. Goal 8,000 - 1,796 to go. Card posted by the Health channel.",
+                0x1F9C6C,
+            );
 
-        let tasks = [App::Messages, App::Chrome, App::Gallery, App::Music]
-            .into_iter()
-            .map(|app| Task {
-                app,
-                title: app.name().to_string(),
-                caption: "Opened from Home".to_string(),
-                accent: app.accent(),
-                resume_t: 0.0,
-                dismiss_t: 0.0,
-                dying: false,
-                x_off: 0.0,
-            })
-            .collect();
+            tasks = [App::Messages, App::Chrome, App::Gallery, App::Music]
+                .into_iter()
+                .map(|app| Task {
+                    mock: Some(app),
+                    package: None,
+                    activity: None,
+                    title: app.name().to_string(),
+                    caption: "Opened from Home".to_string(),
+                    accent: app.accent(),
+                    resume_t: 0.0,
+                    dismiss_t: 0.0,
+                    dying: false,
+                    x_off: 0.0,
+                })
+                .collect();
 
-        Self {
-            screen: Screen::Home,
-            pager: Pager::new(5),
-            hidden: HiddenSpace::new(),
-            cards,
-            tasks,
-            carousel: 0,
-            carousel_drag: 0.0,
-            task_drag: None,
-            drawer_t: 0.0,
-            drawer_scroll: 0.0,
-            shelf_t: 0.0,
-            shelf_scroll: 0.0,
-            shelf_content_h: 0.0,
-            shelf_open: false,
-            hidden_t: 0.0,
-            overview_t: 0.0,
-            lock_t: 0.0,
-            folder_t: 0.0,
-            folder: None,
-            locked_ui: false,
-            theme_dark: true,
-            toast: Some(("Swipe down from the status bar for the shade".into(), 2.6)),
-            time: clock::now(),
-            shade_t: 0.0,
-            brightness: 0.88,
-            tiles: [true, false, false, false, true, false],
-            notifs: vec![
+            notifs = vec![
                 Notif {
                     app: App::Weather,
                     title: "Weather".into(),
@@ -259,7 +346,61 @@ impl LauncherLab {
                     when: "1h".into(),
                     accent: 0x00A0FF,
                 },
-            ],
+            ];
+        }
+
+        let mut hidden = HiddenSpace::new();
+        if android {
+            // The demo items are not real apps; a device build shows none.
+            hidden.clear_items();
+        }
+
+        let loader = if android { Loader::spawn() } else { None };
+
+        let mut lab = Self {
+            screen: Screen::Home,
+            pager: Pager::new(5),
+            hidden,
+            cards,
+            tasks,
+            carousel: 0,
+            carousel_drag: 0.0,
+            task_drag: None,
+            drawer_t: 0.0,
+            drawer_scroll: 0.0,
+            shelf_t: 0.0,
+            shelf_scroll: 0.0,
+            shelf_content_h: 0.0,
+            shelf_open: false,
+            hidden_t: 0.0,
+            overview_t: 0.0,
+            lock_t: 0.0,
+            folder_t: 0.0,
+            folder: None,
+            drawer: Vec::new(),
+            drawer_state: DrawerState::Loading,
+            drawer_attempt_t: 0.0,
+            icon_cache: HashMap::new(),
+            icon_error_shown: false,
+            apps_loaded_once: false,
+            apps_error_toasted: false,
+            resolved_targets: HashMap::new(),
+            wallpaper_tex: None,
+            wallpaper_requested: false,
+            loader,
+            hidden_real: Vec::new(),
+            search_letter: None,
+            search_open: false,
+            system: SystemState::default(),
+            locked_ui: false,
+            theme_dark: true,
+            toast: None,
+            toast_queue: VecDeque::new(),
+            time: clock::now(),
+            shade_t: 0.0,
+            brightness: 0.88,
+            tiles: [true, false, false, false, true, false],
+            notifs,
             open_app: None,
             onboard: true,
             hidden_apps: Vec::new(),
@@ -272,13 +413,31 @@ impl LauncherLab {
             last_tap: None,
             memo_seq: 0,
             drawer_hint_shown: false,
+        };
+
+        if android {
+            lab.refresh_states_if_device();
+            lab.toast("Loading installed apps\u{2026}");
+            lab.request_apps();
+        } else {
+            lab.toast = Some(("Swipe down from the status bar for the shade".into(), 2.6));
         }
+        lab
     }
 
     // ------------------------------------------------------------- helpers
 
+    /// Show a toast now, or queue it behind the one on screen.
     fn toast(&mut self, msg: impl Into<String>) {
-        self.toast = Some((msg.into(), 2.2));
+        let msg = msg.into();
+        if self.toast.is_none() {
+            self.toast = Some((msg, 2.4));
+        } else {
+            if self.toast_queue.len() >= 4 {
+                self.toast_queue.pop_front();
+            }
+            self.toast_queue.push_back(msg);
+        }
     }
 
     /// Topmost allowed hit at `pos`, together with its rectangle.
@@ -290,13 +449,102 @@ impl LauncherLab {
             .map(|(r, h)| (*r, h.clone()))
     }
 
-    /// Apps currently listed in the drawer (hidden ones live in Hidden Space).
-    pub fn visible_drawer(&self) -> Vec<App> {
-        icons::DRAWER
-            .iter()
-            .copied()
-            .filter(|a| !self.hidden_apps.contains(a))
-            .collect()
+    /// Drawer listing for the current build (real on device, catalog on host).
+    pub fn visible_drawer(&self) -> Vec<DrawerKey> {
+        if platform::is_android() {
+            self.drawer
+                .iter()
+                .filter(|entry| {
+                    !self
+                        .hidden_real
+                        .iter()
+                        .any(|hidden| hidden.package == entry.package)
+                })
+                .filter(|entry| letter_ok(&entry.label, self.search_letter))
+                .map(|entry| DrawerKey::Real(entry.package.clone()))
+                .collect()
+        } else {
+            icons::DRAWER
+                .iter()
+                .copied()
+                .filter(|app| !self.hidden_apps.contains(app))
+                .filter(|app| letter_ok(app.name(), self.search_letter))
+                .map(DrawerKey::Mock)
+                .collect()
+        }
+    }
+
+    /// The full row for a real package, if it is installed.
+    pub fn drawer_entry(&self, package: &str) -> Option<&DrawerEntry> {
+        self.drawer.iter().find(|entry| entry.package == package)
+    }
+
+    /// Hidden Space rows in display order (mirrored by `views` and input).
+    pub fn hidden_entries(&self) -> Vec<HiddenEntry> {
+        merge_hidden(&self.hidden_apps, &self.hidden_real, self.hidden.items())
+    }
+
+    /// A ready icon texture for a package, if one has been built.
+    pub fn icon_texture(&self, package: &str) -> Option<&egui::TextureHandle> {
+        match self.icon_cache.get(package) {
+            Some(IconSlot::Ready(texture)) => Some(texture),
+            _ => None,
+        }
+    }
+
+    /// The real component a reconstructed app resolved to (device).
+    pub fn resolved(&self, app: App) -> Option<&RealApp> {
+        self.resolved_targets.get(&app)
+    }
+
+    /// The installed package for a reconstructed app, if any.
+    pub fn resolved_package(&self, app: App) -> Option<&str> {
+        self.resolved(app).map(|real| real.package.as_str())
+    }
+
+    /// Whether quick-tile `i` is on (live on device, demo state on host).
+    pub fn tile_on(&self, i: usize) -> bool {
+        if platform::is_android() {
+            match i {
+                0 => self.system.wifi.unwrap_or(false),
+                1 => self.system.bluetooth.unwrap_or(false),
+                // The flashlight cannot be read or driven by an unprivileged
+                // app, so the tile never claims to be on.
+                2 => false,
+                3 => self.system.airplane.unwrap_or(false),
+                4 => self.system.auto_rotate.unwrap_or(false),
+                5 => self.system.battery_saver.unwrap_or(false),
+                _ => false,
+            }
+        } else {
+            self.tiles.get(i).copied().unwrap_or(false)
+        }
+    }
+
+    /// Shelf "Recent apps" rows (real launches on device).
+    pub fn shelf_recents(&self) -> Vec<ShelfRecent> {
+        if platform::is_android() {
+            self.tasks
+                .iter()
+                .take(10)
+                .map(|task| ShelfRecent {
+                    mock: task.mock,
+                    package: task.package.clone(),
+                    activity: task.activity.clone(),
+                    label: task.title.clone(),
+                })
+                .collect()
+        } else {
+            icons::SHELF_RECENTS
+                .iter()
+                .map(|app| ShelfRecent {
+                    mock: Some(*app),
+                    package: None,
+                    activity: None,
+                    label: app.name().to_string(),
+                })
+                .collect()
+        }
     }
 
     /// Only hits belonging to the current surface are live.
@@ -331,7 +579,14 @@ impl LauncherLab {
                     Hit::HiddenClose | Hit::HiddenAdd | Hit::HiddenMenu | Hit::HiddenItem(_)
                 )
             }
-            Screen::Drawer => matches!(h, Hit::DrawerApp(_) | Hit::DrawerSearch | Hit::DrawerMenu),
+            Screen::Drawer => matches!(
+                h,
+                Hit::DrawerApp(_)
+                    | Hit::DrawerSearch
+                    | Hit::DrawerSearchClear
+                    | Hit::DrawerLetter(_)
+                    | Hit::DrawerMenu
+            ),
             Screen::Overview => matches!(h, Hit::Task(_) | Hit::TaskIcon(_) | Hit::TaskClearAll),
             Screen::Home => {
                 if self.folder.is_some() {
@@ -354,7 +609,7 @@ impl LauncherLab {
     }
 
     fn shelf_open_or_visible(&self) -> bool {
-        self.shelf_open
+        self.shelf_open || self.shelf_t > 0.02
     }
 
     fn open_drawer_hint(&mut self) {
@@ -364,39 +619,185 @@ impl LauncherLab {
         }
     }
 
-    fn launch(&mut self, app: App, src: Rect) {
-        let name = app.name().to_string();
-        self.tasks.insert(
-            0,
-            Task {
-                app,
-                title: name.clone(),
-                caption: "Opened from Home".to_string(),
-                accent: app.accent(),
-                resume_t: 1.0,
-                dismiss_t: 0.0,
-                dying: false,
-                x_off: 0.0,
-            },
-        );
-        self.tasks.truncate(6);
-        self.carousel = 0;
-        if self.screen == Screen::Shade {
-            self.screen = Screen::Home;
+    // -------------------------------------------------------- device data
+
+    /// Ask the loader for the installed-app list.
+    fn request_apps(&mut self) {
+        self.drawer_attempt_t = self.now;
+        let outcome = match &self.loader {
+            Some(loader) => Some(loader.request(Request::Apps)),
+            None => None,
+        };
+        match outcome {
+            Some(Ok(())) => {
+                if !matches!(self.drawer_state, DrawerState::Ready) {
+                    self.drawer_state = DrawerState::Loading;
+                }
+            }
+            Some(Err(error)) => {
+                let message = error.user_message();
+                self.drawer_state = DrawerState::Failed(message.clone());
+                self.toast(message);
+            }
+            None => {
+                let message = PlatformError::NotInitialized.user_message();
+                self.drawer_state = DrawerState::Failed(message.clone());
+                self.toast(message);
+            }
         }
-        self.open_app = Some(OpenApp { app, t: 0.0, src });
-        self.toast(format!("{name} - demo preview"));
     }
 
-    /// Resume a recents card: bring it to the front and preview it.
-    fn resume(&mut self, i: usize, src: Rect) {
-        if i < self.tasks.len() {
-            let t = self.tasks.remove(i);
-            let app = t.app;
-            self.tasks.insert(0, t);
+    /// Queue an icon request unless this package already has one.
+    fn request_icon(&mut self, package: &str) {
+        if self.icon_cache.contains_key(package) {
+            return;
+        }
+        if platform::validate_package(package).is_err() {
+            self.icon_cache
+                .insert(package.to_owned(), IconSlot::Failed);
+            return;
+        }
+        self.icon_cache.insert(package.to_owned(), IconSlot::Queued);
+        let outcome = match &self.loader {
+            Some(loader) => Some(loader.request(Request::Icon {
+                package: package.to_owned(),
+                size: ICON_TEXTURE_EDGE,
+            })),
+            None => None,
+        };
+        if let Some(Err(error)) = outcome {
+            self.toast(error.user_message());
+        }
+    }
+
+    /// Re-read the live toggle states (device only).
+    fn refresh_states_if_device(&mut self) {
+        if platform::is_android() {
+            if let Ok(states) = platform::read_system_states() {
+                self.system = states;
+            }
+        }
+    }
+
+    /// Launch a real component; on success the app moves to the recents top.
+    fn launch_real(&mut self, real: &RealApp, origin: &str) {
+        match platform::launch_app(real) {
+            Ok(()) => {
+                let mock = targets::app_for_package(&real.package);
+                let accent = mock
+                    .map(|app| app.accent())
+                    .unwrap_or_else(|| targets::accent_for_package(&real.package));
+                self.tasks.retain(|task| {
+                    task.package.as_deref() != Some(real.package.as_str())
+                });
+                self.tasks.insert(
+                    0,
+                    Task {
+                        mock,
+                        package: Some(real.package.clone()),
+                        activity: Some(real.activity.clone()),
+                        title: real.label.clone(),
+                        caption: origin.to_owned(),
+                        accent,
+                        resume_t: 1.0,
+                        dismiss_t: 0.0,
+                        dying: false,
+                        x_off: 0.0,
+                    },
+                );
+                self.tasks.truncate(8);
+                self.carousel = 0;
+            }
+            Err(error) => self.toast(error.user_message()),
+        }
+    }
+
+    /// Activate a reconstructed launcher entry.
+    ///
+    /// Device: resolve to a real component and launch it. Desktop: open the
+    /// bundled demo preview.
+    fn activate(&mut self, app: App, src: Rect, origin: &str) {
+        if platform::is_android() {
+            let real = self
+                .resolved(app)
+                .cloned()
+                .or_else(|| targets::resolve(app, &[], false));
+            match real {
+                Some(real) => self.launch_real(&real, origin),
+                None => self.toast(format!("{} isn't installed on this phone", app.name())),
+            }
+        } else {
+            let name = app.name().to_string();
+            self.tasks.insert(
+                0,
+                Task {
+                    mock: Some(app),
+                    package: None,
+                    activity: None,
+                    title: name.clone(),
+                    caption: origin.to_owned(),
+                    accent: app.accent(),
+                    resume_t: 1.0,
+                    dismiss_t: 0.0,
+                    dying: false,
+                    x_off: 0.0,
+                },
+            );
+            self.tasks.truncate(6);
             self.carousel = 0;
+            if self.screen == Screen::Shade {
+                self.screen = Screen::Home;
+            }
             self.open_app = Some(OpenApp { app, t: 0.0, src });
-            self.toast(format!("Resumed {} (demo)", app.name()));
+            self.toast(format!("{name} - demo preview"));
+        }
+    }
+
+    /// Resume a recents card: bring it to the front and relaunch / preview it.
+    fn resume(&mut self, i: usize, src: Rect) {
+        if i >= self.tasks.len() {
+            return;
+        }
+        let task = self.tasks.remove(i);
+        self.carousel = 0;
+        if platform::is_android() {
+            let label = task.title.clone();
+            let Some(package) = task.package.clone() else {
+                self.tasks.insert(0, task);
+                self.toast("This entry has no live app behind it");
+                return;
+            };
+            let activity = task.activity.clone().or_else(|| {
+                self.drawer
+                    .iter()
+                    .find(|entry| entry.package == package)
+                    .map(|entry| entry.activity.clone())
+            });
+            self.tasks.insert(0, task);
+            match activity {
+                Some(activity) => {
+                    let real = RealApp {
+                        package,
+                        activity,
+                        label,
+                    };
+                    if let Err(error) = platform::launch_app(&real) {
+                        self.toast(error.user_message());
+                    }
+                }
+                None => self.toast("This entry can't be relaunched - open it from the drawer"),
+            }
+        } else {
+            let label = task.title.clone();
+            if let Some(mock) = task.mock {
+                self.open_app = Some(OpenApp {
+                    app: mock,
+                    t: 0.0,
+                    src,
+                });
+            }
+            self.tasks.insert(0, task);
+            self.toast(format!("Resumed {label} (demo)"));
         }
     }
 
@@ -409,9 +810,8 @@ impl LauncherLab {
     fn long_press(
         &mut self,
         card: Option<String>,
-        hide_app: Option<App>,
-        hidden_app: Option<App>,
-        hidden_item: Option<String>,
+        hide_key: Option<DrawerKey>,
+        hidden_entry: Option<HiddenEntry>,
         menu: bool,
         bg: bool,
     ) {
@@ -421,24 +821,61 @@ impl LauncherLab {
             } else {
                 self.toast("Card is publisher-owned (getCard only)");
             }
-        } else if let Some(a) = hide_app {
-            if !self.hidden_apps.contains(&a) {
-                self.hidden_apps.push(a);
+        } else if let Some(key) = hide_key {
+            match key {
+                DrawerKey::Mock(app) => {
+                    if !self.hidden_apps.contains(&app) {
+                        self.hidden_apps.push(app);
+                    }
+                    self.toast(format!("Hidden: {} - in Hidden Space", app.name()));
+                }
+                DrawerKey::Real(package) => {
+                    if !self.hidden_real.iter().any(|h| h.package == package) {
+                        let row = self
+                            .drawer
+                            .iter()
+                            .find(|entry| entry.package == package)
+                            .map(|entry| {
+                                (
+                                    entry.package.clone(),
+                                    entry.activity.clone(),
+                                    entry.label.clone(),
+                                )
+                            });
+                        if let Some((package, activity, label)) = row {
+                            self.request_icon(&package);
+                            self.toast(format!("Hidden: {label} - in Hidden Space"));
+                            self.hidden_real.push(HiddenReal {
+                                package,
+                                activity,
+                                label,
+                            });
+                        }
+                    }
+                }
             }
-            self.toast(format!("Hidden: {} - in Hidden Space", a.name()));
-        } else if let Some(a) = hidden_app {
-            self.hidden_apps.retain(|x| *x != a);
-            self.toast(format!("Restored {} to the drawer", a.name()));
-        } else if let Some(name) = hidden_item {
-            self.hidden.unhide_item(&name);
-            self.toast(format!("Unhidden {name} (demo)"));
+        } else if let Some(entry) = hidden_entry {
+            match entry {
+                HiddenEntry::Mock(app) => {
+                    self.hidden_apps.retain(|x| *x != app);
+                    self.toast(format!("Restored {} to the drawer", app.name()));
+                }
+                HiddenEntry::Real(real) => {
+                    self.hidden_real.retain(|x| x.package != real.package);
+                    self.toast(format!("Restored {} to the drawer", real.label));
+                }
+                HiddenEntry::Demo(item) => {
+                    self.hidden.unhide_item(&item.name);
+                    self.toast(format!("Unhidden {} (demo)", item.name));
+                }
+            }
         } else if menu {
             let on = !self.hidden.password_enabled();
             self.hidden.set_password_enabled(on);
             if on {
                 self.toast("Hidden Space password ON - hold the ring");
             } else {
-                self.toast("Hidden Space password OFF (demo)");
+                self.toast("Hidden Space password OFF");
             }
         } else if bg && self.screen == Screen::Home && !self.onboard && self.open_app.is_none() {
             self.theme_dark = !self.theme_dark;
@@ -455,9 +892,8 @@ impl LauncherLab {
             pos,
             t: time,
             card: None,
-            hidden_item: None,
-            hide_app: None,
-            hidden_app: None,
+            hidden_entry: None,
+            hide_key: None,
             menu: false,
             bg: hit.is_none(),
             unlock: false,
@@ -474,15 +910,15 @@ impl LauncherLab {
                 }
             }
             Some((_, Hit::HiddenItem(i))) => {
-                if *i < self.hidden_apps.len() {
-                    pr.hidden_app = Some(self.hidden_apps[*i]);
-                } else if let Some(it) = self.hidden.items().get(*i - self.hidden_apps.len()) {
-                    pr.hidden_item = Some(it.name.clone());
+                let entries = self.hidden_entries();
+                if let Some(entry) = entries.get(*i) {
+                    pr.hidden_entry = Some(entry.clone());
                 }
             }
             Some((_, Hit::DrawerApp(i))) => {
-                if let Some(a) = self.visible_drawer().get(*i) {
-                    pr.hide_app = Some(*a);
+                let visible = self.visible_drawer();
+                if let Some(key) = visible.get(*i) {
+                    pr.hide_key = Some(key.clone());
                 }
             }
             Some((_, Hit::HiddenMenu)) | Some((_, Hit::DrawerMenu)) => pr.menu = true,
@@ -601,7 +1037,7 @@ impl LauncherLab {
                 if started_low && !want_close && tdy.abs() > tdx.abs() {
                     self.drawer_scroll = (self.drawer_scroll - d.y).clamp(0.0, max);
                 } else if tdy > 0.0 && tdy.abs() > tdx.abs() {
-                    self.drawer_t = (1.0 + tdy / (h * 0.45)).clamp(0.0, 1.0);
+                    self.drawer_t = (1.0 - tdy / (h * 0.45)).clamp(0.0, 1.0);
                 }
             }
             Screen::Hidden => {}
@@ -682,7 +1118,7 @@ impl LauncherLab {
         let w = screen.width();
         let h = screen.height();
 
-        // In-app demo preview: chevron tap or left-edge swipe leaves it.
+        // App preview: chevron tap or left-edge swipe leaves it.
         if self.open_app.is_some() {
             if from_left_edge && dx > w * 0.15 {
                 self.open_app = None;
@@ -707,6 +1143,7 @@ impl LauncherLab {
         if status {
             if self.shade_t > 0.35 || vel.y > 500.0 {
                 self.screen = Screen::Shade;
+                self.refresh_states_if_device();
             }
             return;
         }
@@ -767,7 +1204,6 @@ impl LauncherLab {
                 ReleaseOutcome::OpenHidden => {
                     self.pager.offset = 0.0;
                     self.screen = Screen::Hidden;
-                    self.toast("Hidden Space (demo)");
                 }
                 ReleaseOutcome::GoHome => {
                     self.screen = Screen::Home;
@@ -857,7 +1293,13 @@ impl LauncherLab {
     fn handle_tap(&mut self, pos: Pos2, time: f64) {
         let hit = self.hit_at(pos);
         match hit {
-            Some((_, Hit::Pill)) => self.toast("Google Search (demo)"),
+            Some((hr, Hit::Pill)) => {
+                if platform::is_android() {
+                    self.activate(App::Google, hr, "Home");
+                } else {
+                    self.toast("Google Search (demo)");
+                }
+            }
             Some((_, Hit::PageDot(i))) => {
                 self.pager.current = i.min(self.pager.pages.saturating_sub(1));
                 self.pager.offset = 0.0;
@@ -867,67 +1309,149 @@ impl LauncherLab {
                 self.open_drawer_hint();
             }
             Some((hr, Hit::HomeItem { page, idx })) => match views::item_at(page, idx) {
-                Some(views::HomeItem::App(a)) => self.launch(a, hr),
+                Some(views::HomeItem::App(a)) => self.activate(a, hr, "Home"),
                 Some(views::HomeItem::Folder { .. }) => {
                     self.folder = Some((page, idx));
                 }
                 None => {}
             },
             Some((hr, Hit::Dock(i))) => {
-                if let Some(a) = icons::DOCK.get(i) {
-                    self.launch(*a, hr);
+                if let Some(app) = icons::DOCK.get(i) {
+                    self.activate(*app, hr, "Home");
                 }
             }
             Some((_, Hit::FolderClose)) => self.folder = None,
             Some((hr, Hit::FolderItem(i))) => {
                 if let Some((page, idx)) = self.folder {
                     if let Some(views::HomeItem::Folder { apps, .. }) = views::item_at(page, idx) {
-                        if let Some(a) = apps.get(i) {
-                            self.launch(*a, hr);
+                        if let Some(app) = apps.get(i) {
+                            self.activate(*app, hr, "Home");
                         }
                     }
                 }
                 self.folder = None;
             }
             Some((hr, Hit::DrawerApp(i))) => {
-                if let Some(a) = self.visible_drawer().get(i) {
-                    self.launch(*a, hr);
+                let key = self.visible_drawer().get(i).cloned();
+                match key {
+                    Some(DrawerKey::Mock(app)) => self.activate(app, hr, "Apps"),
+                    Some(DrawerKey::Real(package)) => {
+                        let real = self.drawer_entry(&package).map(|entry| RealApp {
+                            package: entry.package.clone(),
+                            activity: entry.activity.clone(),
+                            label: entry.label.clone(),
+                        });
+                        if let Some(real) = real {
+                            self.launch_real(&real, "Apps");
+                        }
+                    }
+                    None => {}
                 }
                 self.screen = Screen::Home;
             }
-            Some((_, Hit::DrawerSearch)) => self.toast("Search apps (demo)"),
+            Some((_, Hit::DrawerSearch)) => {
+                if let DrawerState::Failed(_) = self.drawer_state {
+                    if platform::is_android() {
+                        self.toast("Retrying the app list\u{2026}");
+                        self.request_apps();
+                    }
+                } else {
+                    self.search_open = !self.search_open;
+                }
+            }
+            Some((_, Hit::DrawerSearchClear)) => {
+                self.search_letter = None;
+                self.search_open = false;
+            }
+            Some((_, Hit::DrawerLetter(i))) => {
+                if let Some(letter) = letter_at(i) {
+                    self.search_letter = Some(letter);
+                    self.search_open = false;
+                    self.drawer_scroll = 0.0;
+                }
+            }
             Some((_, Hit::DrawerMenu)) => self.toast("Hold this glyph: Hidden Space password"),
             Some((_, Hit::HiddenClose)) => self.screen = Screen::Drawer,
-            Some((_, Hit::HiddenAdd)) => self.toast("Add apps to Hidden Space (demo)"),
+            Some((_, Hit::HiddenAdd)) => {
+                if platform::is_android() {
+                    self.toast("Hold an app in the drawer to hide it here");
+                } else {
+                    self.toast("Add apps to Hidden Space (demo)");
+                }
+            }
             Some((_, Hit::HiddenMenu)) => self.toast("Hidden Space options"),
             Some((hr, Hit::HiddenItem(i))) => {
-                if i < self.hidden_apps.len() {
-                    let a = self.hidden_apps[i];
-                    self.launch(a, hr);
-                } else if let Some(it) = self.hidden.items().get(i - self.hidden_apps.len()) {
-                    let n = it.name.clone();
-                    self.toast(format!("Open {n} (demo)"));
+                let entry = self.hidden_entries().get(i).cloned();
+                match entry {
+                    Some(HiddenEntry::Mock(app)) => self.activate(app, hr, "Hidden Space"),
+                    Some(HiddenEntry::Real(real)) => {
+                        let component = RealApp {
+                            package: real.package.clone(),
+                            activity: real.activity.clone(),
+                            label: real.label.clone(),
+                        };
+                        self.launch_real(&component, "Hidden Space");
+                    }
+                    Some(HiddenEntry::Demo(item)) => {
+                        self.toast(format!("{} is preview content, not an app", item.name));
+                    }
+                    None => {}
                 }
             }
             Some((_, Hit::HiddenHold)) => {}
-            Some((_, Hit::ShelfTool(i))) => {
+            Some((hr, Hit::ShelfTool(i))) => {
                 const NAMES: [&str; 5] = ["Calculator", "Selfie", "New timer", "Send files", "New tab"];
-                if let Some(n) = NAMES.get(i) {
-                    self.toast(format!("Toolbox: {n} (demo)"));
+                if platform::is_android() {
+                    // The toolbox rows are real apps on a device.
+                    let target = match i {
+                        0 => Some(App::Calculator),
+                        1 => Some(App::Camera),
+                        2 => Some(App::Clock),
+                        3 => Some(App::Files),
+                        4 => Some(App::Chrome),
+                        _ => None,
+                    };
+                    if let Some(app) = target {
+                        self.activate(app, hr, "Shelf");
+                    }
+                } else if let Some(name) = NAMES.get(i) {
+                    self.toast(format!("Toolbox: {name} (demo)"));
                 }
             }
             Some((hr, Hit::ShelfApp(i))) => {
-                if let Some(a) = icons::SHELF_RECENTS.get(i) {
-                    self.launch(*a, hr);
+                let recent = self.shelf_recents().get(i).cloned();
+                match recent {
+                    Some(row) => match (row.package, row.activity) {
+                        (Some(package), Some(activity)) => {
+                            let real = RealApp {
+                                package,
+                                activity,
+                                label: row.label,
+                            };
+                            self.launch_real(&real, "Shelf");
+                        }
+                        _ => {
+                            if let Some(mock) = row.mock {
+                                self.activate(mock, hr, "Shelf");
+                            }
+                        }
+                    },
+                    None => {}
                 }
             }
-            Some((_, Hit::ShelfAction)) => self.toast("Parking Location: action (demo)"),
+            Some((_, Hit::ShelfAction)) => {
+                if platform::is_android() {
+                    self.toast("Parking tracking needs location access this build doesn't request yet");
+                } else {
+                    self.toast("Parking Location: action (demo)");
+                }
+            }
             Some((_, Hit::ShelfNewNote)) => {
                 self.memo_seq += 1;
                 let tag = format!("memo-{}", self.memo_seq);
-                let body = format!("Reconstructed CardProvider note #{}.", self.memo_seq);
+                let body = format!("Note #{}. Stored by the reconstructed CardProvider.", self.memo_seq);
                 let _ = self.cards.post_card("memo", &tag, "Memo", &body, 0xFFB300);
-                self.toast("postCard(memo) (demo)");
+                self.toast("postCard(memo)");
             }
             Some((_, Hit::ShelfCard(i))) => {
                 if let Some(card) = self.cards.cards().get(i) {
@@ -946,7 +1470,7 @@ impl LauncherLab {
             Some((_, Hit::TaskClearAll)) => {
                 self.tasks.clear();
                 self.carousel = 0;
-                self.toast("Cleared all tasks (demo)");
+                self.toast("Cleared all tasks");
             }
             Some((_, Hit::UnlockTap)) => {
                 self.locked_ui = false;
@@ -974,32 +1498,63 @@ impl LauncherLab {
                 self.screen = Screen::Home;
             }
             Some((_, Hit::ShadeTile(i))) => {
-                const NAMES: [&str; 6] = [
-                    "Wi-Fi",
-                    "Bluetooth",
-                    "Flashlight",
-                    "Airplane",
-                    "Auto-rotate",
-                    "Battery saver",
-                ];
-                if let Some(t) = self.tiles.get_mut(i) {
-                    *t = !*t;
-                }
-                if let Some(n) = NAMES.get(i) {
-                    let on = self.tiles.get(i).copied().unwrap_or(false);
-                    self.toast(format!("{n} {}", if on { "on" } else { "off" }));
+                if platform::is_android() {
+                    const NAMES: [&str; 6] = [
+                        "Wi-Fi",
+                        "Bluetooth",
+                        "Flashlight",
+                        "Airplane mode",
+                        "Display",
+                        "Battery saver",
+                    ];
+                    if i == 2 {
+                        self.toast("Flashlight control is reserved for system apps on Android 10+");
+                        return;
+                    }
+                    let key = match i {
+                        0 => "wifi",
+                        1 => "bluetooth",
+                        3 => "airplane",
+                        4 => "display",
+                        5 => "battery_saver",
+                        _ => "",
+                    };
+                    match platform::open_system_screen(key) {
+                        Ok(()) => {
+                            self.screen = Screen::Home;
+                            let name = NAMES.get(i).copied().unwrap_or("settings");
+                            self.toast(format!("Opened {name} settings"));
+                        }
+                        Err(error) => self.toast(error.user_message()),
+                    }
+                } else {
+                    const NAMES: [&str; 6] = [
+                        "Wi-Fi",
+                        "Bluetooth",
+                        "Flashlight",
+                        "Airplane",
+                        "Auto-rotate",
+                        "Battery saver",
+                    ];
+                    if let Some(t) = self.tiles.get_mut(i) {
+                        *t = !*t;
+                    }
+                    if let Some(n) = NAMES.get(i) {
+                        let on = self.tiles.get(i).copied().unwrap_or(false);
+                        self.toast(format!("{n} {}", if on { "on" } else { "off" }));
+                    }
                 }
             }
             Some((_, Hit::ShadeBrightness)) => {}
             Some((_, Hit::ShadeClearAll)) => {
                 self.notifs.clear();
-                self.toast("Notifications cleared (demo)");
+                self.toast("Notifications cleared");
             }
             Some((hr, Hit::ShadeNotif(i))) => {
                 let a = self.notifs.get(i).map(|n| n.app);
                 if let Some(a) = a {
                     self.screen = Screen::Home;
-                    self.launch(a, hr);
+                    self.activate(a, hr, "Home");
                 }
             }
             Some((_, Hit::OnboardOk)) => {
@@ -1095,7 +1650,7 @@ impl LauncherLab {
             self.carousel = self.carousel.min(self.tasks.len() - 1);
         }
 
-        // Toast lifetime.
+        // Toast lifetime, then the next queued message.
         let mut clear = false;
         if let Some((_, ttl)) = self.toast.as_mut() {
             *ttl -= dt;
@@ -1103,22 +1658,35 @@ impl LauncherLab {
         }
         if clear {
             self.toast = None;
+            if let Some(next) = self.toast_queue.pop_front() {
+                self.toast = Some((next, 2.4));
+            }
+        }
+
+        // Retry the installed-apps query while it keeps failing.
+        if platform::is_android()
+            && matches!(self.drawer_state, DrawerState::Failed(_))
+            && self.now - self.drawer_attempt_t >= APPS_RETRY_SECONDS
+        {
+            self.request_apps();
         }
 
         // Long-press (0.65 s) on the latching targets.
-        if let Some(pr) = &self.press {
-            if !pr.consumed && self.now - pr.t > 0.65 {
-                let card = pr.card.clone();
-                let hide_app = pr.hide_app;
-                let hidden_app = pr.hidden_app;
-                let hidden_item = pr.hidden_item.clone();
-                let menu = pr.menu;
-                let bg = pr.bg;
-                if let Some(p) = &mut self.press {
-                    p.consumed = true;
-                }
-                self.long_press(card, hide_app, hidden_app, hidden_item, menu, bg);
+        let fired = match &self.press {
+            Some(pr) if !pr.consumed && self.now - pr.t > 0.65 => Some((
+                pr.card.clone(),
+                pr.hide_key.clone(),
+                pr.hidden_entry.clone(),
+                pr.menu,
+                pr.bg,
+            )),
+            _ => None,
+        };
+        if let Some((card, hide_key, hidden_entry, menu, bg)) = fired {
+            if let Some(p) = &mut self.press {
+                p.consumed = true;
             }
+            self.long_press(card, hide_key, hidden_entry, menu, bg);
         }
 
         // Hold-to-unlock ring on the Hidden Space gate.
@@ -1139,6 +1707,110 @@ impl LauncherLab {
         }
     }
 
+    /// Convert finished loader work into UI state and textures.
+    fn poll_loader(&mut self, ctx: &Context) {
+        let replies = match &self.loader {
+            Some(loader) => loader.drain(LOADER_REPLIES_PER_FRAME),
+            None => return,
+        };
+        for reply in replies {
+            match reply {
+                Reply::Apps(Ok(apps)) => {
+                    self.drawer = apps
+                        .iter()
+                        .map(|real| DrawerEntry {
+                            package: real.package.clone(),
+                            activity: real.activity.clone(),
+                            label: real.label.clone(),
+                            mock: targets::app_for_package(&real.package),
+                        })
+                        .collect();
+                    self.resolved_targets = targets::resolve_all(&apps);
+                    self.drawer_state = DrawerState::Ready;
+
+                    // Queue icons for everything that can be drawn: the whole
+                    // drawer, the resolved home/dock entries and hidden apps.
+                    let mut packages: Vec<String> = self
+                        .drawer
+                        .iter()
+                        .map(|entry| entry.package.clone())
+                        .collect();
+                    for real in self.resolved_targets.values() {
+                        if !packages.iter().any(|package| package == &real.package) {
+                            packages.push(real.package.clone());
+                        }
+                    }
+                    for hidden in &self.hidden_real {
+                        if !packages.iter().any(|package| package == &hidden.package) {
+                            packages.push(hidden.package.clone());
+                        }
+                    }
+                    let count = self.drawer.len();
+                    for package in packages {
+                        self.request_icon(&package);
+                    }
+                    if !self.apps_loaded_once {
+                        self.apps_loaded_once = true;
+                        self.toast(format!("{count} installed apps loaded"));
+                    } else if self.apps_error_toasted {
+                        self.toast("App list refreshed");
+                    }
+                    self.apps_error_toasted = false;
+                }
+                Reply::Apps(Err(error)) => {
+                    if !self.apps_error_toasted {
+                        self.apps_error_toasted = true;
+                        self.toast(error.user_message());
+                    }
+                    log::warn!("apps query failed: {error}");
+                    self.drawer_state = DrawerState::Failed(error.user_message());
+                }
+                Reply::Icon { package, result } => match result {
+                    Ok(image) => {
+                        let texture =
+                            texture_from_image(ctx, format!("icon:{package}"), &image);
+                        self.icon_cache
+                            .insert(package, IconSlot::Ready(texture));
+                    }
+                    Err(error) => {
+                        log::warn!("icon decode failed for {package}: {error}");
+                        if !self.icon_error_shown {
+                            self.icon_error_shown = true;
+                            self.toast(error.user_message());
+                        }
+                        self.icon_cache.insert(package, IconSlot::Failed);
+                    }
+                },
+                Reply::Wallpaper(Ok(image)) => {
+                    self.wallpaper_tex =
+                        Some(texture_from_image(ctx, "system-wallpaper".to_owned(), &image));
+                }
+                Reply::Wallpaper(Err(error)) => {
+                    log::warn!("wallpaper load failed: {error}");
+                    self.toast(error.user_message());
+                }
+            }
+        }
+    }
+
+    /// Fetch the real wallpaper once the window size is known (device only).
+    fn maybe_request_wallpaper(&mut self, ctx: &Context) {
+        if !platform::is_android() || self.wallpaper_requested || self.loader.is_none() {
+            return;
+        }
+        self.wallpaper_requested = true;
+        let pixels_per_point = ctx.pixels_per_point();
+        let size = ctx.screen_rect().size();
+        let width = (size.x * pixels_per_point * 1.2).round() as u32;
+        let height = (size.y * pixels_per_point).round() as u32;
+        let outcome = match &self.loader {
+            Some(loader) => Some(loader.request(Request::Wallpaper { width, height })),
+            None => None,
+        };
+        if let Some(Err(error)) = outcome {
+            self.toast(error.user_message());
+        }
+    }
 }
 
 impl eframe::App for LauncherLab {
@@ -1165,11 +1837,66 @@ impl eframe::App for LauncherLab {
             self.finish(pos, time, vel, screen);
         }
         self.tick(dt, screen);
+        self.poll_loader(ctx);
+        self.maybe_request_wallpaper(ctx);
 
         let painter = ctx.layer_painter(egui::LayerId::background());
         let rect = Rect::from_min_size(Pos2::ZERO, screen.size());
         views::paint(self, &painter, rect);
 
         ctx.request_repaint();
+    }
+}
+
+/// Upload a decoded image as an egui texture (render thread only).
+fn texture_from_image(ctx: &Context, name: String, image: &ImageRgba) -> egui::TextureHandle {
+    let color = egui::ColorImage::from_rgba_unmultiplied(
+        [image.width as usize, image.height as usize],
+        &image.rgba,
+    );
+    ctx.load_texture(name, color, egui::TextureOptions::LINEAR)
+}
+
+/// Case-insensitive first-letter filter used by the drawer search field.
+fn letter_ok(label: &str, letter: Option<char>) -> bool {
+    match letter {
+        None => true,
+        Some(letter) => label
+            .chars()
+            .next()
+            .map(|first| first.to_ascii_uppercase() == letter)
+            .unwrap_or(false),
+    }
+}
+
+/// Letter for a panel cell index (`0..26` -> `A..Z`).
+fn letter_at(index: usize) -> Option<char> {
+    if index < 26 {
+        char::from_u32('A' as u32 + index as u32)
+    } else {
+        None
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{letter_at, letter_ok};
+
+    #[test]
+    fn letter_filter_matches_case_insensitively() {
+        assert!(letter_ok("Chrome", None));
+        assert!(letter_ok("Chrome", Some('C')));
+        assert!(letter_ok("chrome", Some('C')));
+        assert!(!letter_ok("Chrome", Some('A')));
+        assert!(!letter_ok("", Some('A')));
+        assert!(letter_ok("1140", Some('1')));
+    }
+
+    #[test]
+    fn letter_panel_indices_map_to_the_alphabet() {
+        assert_eq!(letter_at(0), Some('A'));
+        assert_eq!(letter_at(25), Some('Z'));
+        assert_eq!(letter_at(26), None);
+        assert_eq!(letter_at(999), None);
     }
 }

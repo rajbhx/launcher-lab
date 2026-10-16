@@ -9,12 +9,16 @@
 
 use eframe::egui::{
     pos2, vec2, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind,
+    TextureHandle,
 };
 
-use crate::app::LauncherLab;
+use crate::app::{DrawerKey, DrawerState, LauncherLab, Task};
 use crate::clock;
 use crate::icons::{self, App};
+use crate::model::hidden::HiddenEntry;
 use crate::model::state::Screen;
+use crate::platform;
+use crate::targets;
 use crate::theme::{self, Palette};
 use crate::wallpaper;
 
@@ -30,6 +34,10 @@ pub enum Hit {
     FolderItem(usize),
     DrawerApp(usize),
     DrawerSearch,
+    /// `✕` inside the search field: clears the letter filter.
+    DrawerSearchClear,
+    /// One cell of the on-screen A-Z filter panel (`0..26`).
+    DrawerLetter(usize),
     DrawerMenu,
     HiddenClose,
     HiddenAdd,
@@ -154,13 +162,58 @@ fn label(
     p.text(pos, anchor, text, font, col);
 }
 
+/// One app icon: the real texture when it is loaded, the reconstructed
+/// painter when the package is known, a letter disc as the last resort.
+/// `package` is `None` for pure catalog rows (desktop preview).
+fn draw_slot_icon(
+    app: &LauncherLab,
+    p: &Painter,
+    slot: Rect,
+    package: Option<&str>,
+    mock: Option<App>,
+    title: &str,
+) {
+    if let Some(package) = package {
+        if let Some(texture) = app.icon_texture(package) {
+            p.image(
+                texture.id(),
+                slot.shrink(2.0),
+                Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+                Color32::WHITE,
+            );
+            return;
+        }
+    }
+    if let Some(mock) = mock {
+        mock.draw(p, slot);
+        return;
+    }
+    if let Some(package) = package {
+        let accent = targets::accent_for_package(package);
+        let letter = title
+            .chars()
+            .next()
+            .map(|c| c.to_string())
+            .unwrap_or_else(|| "?".to_owned());
+        icons::draw_letter(p, slot, accent, &letter);
+    }
+}
+
+/// Icon for a recents card / shelf recent row (real package or demo mock).
+fn draw_task_icon(app: &LauncherLab, p: &Painter, slot: Rect, task: &Task) {
+    draw_slot_icon(app, p, slot, task.package.as_deref(), task.mock, &task.title);
+}
+
 // ------------------------------------------------------------------- paint
 
 pub fn paint(app: &mut LauncherLab, p: &Painter, rect: Rect) {
     let mut hits = std::mem::take(&mut app.hits);
     let pal = theme::palette(app.theme_dark);
 
-    wallpaper::paint(p, rect, app.pager.offset);
+    match &app.wallpaper_tex {
+        Some(texture) => draw_wallpaper(p, rect, texture, app.pager.offset),
+        None => wallpaper::paint(p, rect, app.pager.offset),
+    }
 
     draw_home(app, p, rect, &mut hits, &pal);
 
@@ -210,6 +263,27 @@ pub fn paint(app: &mut LauncherLab, p: &Painter, rect: Rect) {
     app.hits = hits;
 }
 
+/// Aspect-fill the real system wallpaper; the small horizontal overscan lets
+/// the home pager parallax slide it without exposing an edge.
+fn draw_wallpaper(p: &Painter, rect: Rect, texture: &TextureHandle, parallax: f32) {
+    let size = texture.size_vec2();
+    if size.x <= 0.0 || size.y <= 0.0 {
+        return;
+    }
+    let scale = (rect.width() / size.x).max(rect.height() / size.y);
+    let drawn = size * scale;
+    let margin = ((drawn.x - rect.width()) * 0.5).max(0.0);
+    let offset = (-parallax * 0.15).clamp(-margin, margin);
+    let target = Rect::from_min_size(rect.center() - drawn * 0.5 + vec2(offset, 0.0), drawn);
+    let clipped = p.with_clip_rect(rect);
+    clipped.image(
+        texture.id(),
+        target,
+        Rect::from_min_max(pos2(0.0, 0.0), pos2(1.0, 1.0)),
+        Color32::WHITE,
+    );
+}
+
 // -------------------------------------------------------------------- home
 
 fn draw_home(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect, Hit)>, pal: &Palette) {
@@ -233,7 +307,8 @@ fn draw_home(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect, H
             );
             match item {
                 HomeItem::App(a) => {
-                    a.draw(p, s);
+                    let package = app.resolved_package(a);
+                    draw_slot_icon(app, p, s, package, Some(a), a.name());
                     label(
                         p,
                         pos2(s.center().x, s.bottom() + 11.0),
@@ -263,10 +338,11 @@ fn draw_home(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect, H
 
     // Dock (no labels) + gesture area.
     let dock_cy = rect.bottom() - NAV_H - HOTSEAT_H * 0.5;
-    for (i, app) in icons::DOCK.iter().enumerate() {
+    for (i, dock_app) in icons::DOCK.iter().enumerate() {
         let cx = rect.left() + (i as f32 + 0.5) * w / icons::DOCK.len() as f32;
         let s = Rect::from_center_size(pos2(cx, dock_cy), vec2(ICON, ICON));
-        app.draw(p, s);
+        let package = app.resolved_package(*dock_app);
+        draw_slot_icon(app, p, s, package, Some(*dock_app), dock_app.name());
         hits.push((s.expand(4.0), Hit::Dock(i)));
     }
 
@@ -444,7 +520,8 @@ fn draw_folder(
         let cx = panel.left() + (i % 4) as f32 * cw + cw * 0.5;
         let cy = panel.top() + 24.0 + (i / 4) as f32 * 84.0 + 26.0;
         let s = Rect::from_center_size(pos2(cx, cy), vec2(56.0, 56.0));
-        a.draw(p, s);
+        let package = app.resolved_package(*a);
+        draw_slot_icon(app, p, s, package, Some(*a), a.name());
         label(
             p,
             pos2(cx, cy + 42.0),
@@ -479,7 +556,10 @@ fn draw_drawer(
     let panel = rect.translate(vec2(0.0, (1.0 - app.drawer_t) * rect.height()));
     p.rect_filled(panel, CornerRadius::ZERO, pal.panel);
 
-    // "Search apps" field.
+    let android = platform::is_android();
+
+    // "Search apps" field. While a letter filter is active the field shows
+    // it plus a clear button; a failed device query turns it into a retry.
     let field = Rect::from_min_size(
         pos2(panel.left() + 16.0, panel.top() + 44.0),
         vec2(panel.width() - 32.0, 46.0),
@@ -491,15 +571,30 @@ fn draw_drawer(
         20.0,
         pal.text_dim,
     );
+    let filtering = app.search_letter.is_some();
+    let field_text = match (app.search_letter, &app.drawer_state) {
+        (Some(letter), _) => format!("Starts with {letter}"),
+        (None, DrawerState::Failed(_)) if android => "Tap to retry".to_owned(),
+        _ => "Search apps".to_owned(),
+    };
     label(
         p,
         pos2(field.left() + 46.0, field.center().y),
         Align2::LEFT_CENTER,
-        "Search apps",
+        &field_text,
         theme::font(16.0),
         pal.text_dim,
         false,
     );
+    if filtering {
+        let xc = pos2(field.right() - 64.0, field.center().y);
+        icons::line(p, xc - vec2(6.0, 6.0), xc + vec2(6.0, 6.0), 2.0, pal.text_dim);
+        icons::line(p, xc + vec2(-6.0, 6.0), xc + vec2(6.0, -6.0), 2.0, pal.text_dim);
+        hits.push((
+            Rect::from_center_size(xc, vec2(40.0, 44.0)),
+            Hit::DrawerSearchClear,
+        ));
+    }
     icons::dots3v(p, pos2(field.right() - 24.0, field.center().y), 6.5, 2.1, pal.text_dim);
     hits.push((field, Hit::DrawerSearch));
     hits.push((
@@ -510,42 +605,81 @@ fn draw_drawer(
         Hit::DrawerMenu,
     ));
 
-    // App grid.
-    let grid_top = panel.top() + 118.0 - app.drawer_scroll;
-    let slot_w = panel.width() / COLS as f32;
-    let row_h = 96.0;
+    // App grid (real installed apps on device, demo catalog on desktop).
     let visible = app.visible_drawer();
     let rows = visible.len().div_ceil(COLS);
+    let slot_w = panel.width() / COLS as f32;
+    let row_h = 96.0;
     let content_h = rows as f32 * row_h + 40.0;
     let view_h = (panel.height() - 118.0).max(1.0);
-    if visible.is_empty() {
+    let scroll = app.drawer_scroll.min((content_h - view_h).max(0.0));
+    let grid_top = panel.top() + 118.0 - scroll;
+
+    // Status / empty-state line.
+    let status = match &app.drawer_state {
+        DrawerState::Loading if android => Some("Reading installed apps\u{2026}".to_owned()),
+        DrawerState::Failed(message) if android => Some(message.clone()),
+        _ if visible.is_empty() => match app.search_letter {
+            Some(letter) => Some(format!("No apps start with {letter}")),
+            None if android => Some("No apps found".to_owned()),
+            None => Some("All apps live in Hidden Space".to_owned()),
+        },
+        _ => None,
+    };
+    if let Some(text) = status {
         label(
             p,
             pos2(panel.center().x, panel.top() + 240.0),
             Align2::CENTER_CENTER,
-            "All apps live in Hidden Space",
+            &text,
             theme::font(15.0),
             pal.text_dim,
             false,
         );
     }
-    for (i, a) in visible.iter().enumerate() {
+
+    for (i, key) in visible.iter().enumerate() {
         let cx = panel.left() + (i % COLS) as f32 * slot_w + slot_w * 0.5;
         let cy = grid_top + (i / COLS) as f32 * row_h + 38.0;
         if cy - 38.0 < panel.top() + 112.0 || cy + 44.0 > panel.bottom() - 6.0 {
             continue;
         }
         let s = Rect::from_center_size(pos2(cx, cy), vec2(56.0, 56.0));
-        a.draw(p, s);
-        label(
-            p,
-            pos2(cx, cy + 38.0),
-            Align2::CENTER_CENTER,
-            a.name(),
-            theme::font(13.0),
-            theme::with_alpha(pal.text, 0.86),
-            false,
-        );
+        match key {
+            DrawerKey::Mock(mock) => {
+                draw_slot_icon(app, p, s, None, Some(*mock), mock.name());
+                label(
+                    p,
+                    pos2(cx, cy + 38.0),
+                    Align2::CENTER_CENTER,
+                    mock.name(),
+                    theme::font(13.0),
+                    theme::with_alpha(pal.text, 0.86),
+                    false,
+                );
+            }
+            DrawerKey::Real(package) => {
+                if let Some(entry) = app.drawer_entry(package) {
+                    draw_slot_icon(
+                        app,
+                        p,
+                        s,
+                        Some(entry.package.as_str()),
+                        entry.mock,
+                        &entry.label,
+                    );
+                    label(
+                        p,
+                        pos2(cx, cy + 38.0),
+                        Align2::CENTER_CENTER,
+                        &entry.label,
+                        theme::font(13.0),
+                        theme::with_alpha(pal.text, 0.86),
+                        false,
+                    );
+                }
+            }
+        }
         hits.push((s.expand(12.0), Hit::DrawerApp(i)));
     }
 
@@ -557,7 +691,7 @@ fn draw_drawer(
         );
         icons::rrect(p, track, 1.2, theme::with_alpha(pal.text, 0.08));
         let th = (view_h / content_h).clamp(0.15, 1.0);
-        let frac = (app.drawer_scroll / (content_h - view_h)).clamp(0.0, 1.0);
+        let frac = (scroll / (content_h - view_h)).clamp(0.0, 1.0);
         icons::rrect(
             p,
             Rect::from_min_size(
@@ -589,6 +723,42 @@ fn draw_drawer(
         theme::white(0.35),
         false,
     );
+
+    // On-screen A-Z panel (drawn last so it covers the grid; its hits are
+    // pushed last so they win over the app cells below).
+    if app.search_open {
+        let lp = Rect::from_min_size(
+            pos2(panel.left() + 12.0, panel.top() + 98.0),
+            vec2(panel.width() - 24.0, 250.0),
+        );
+        icons::rrect(p, lp, 20.0, pal.card);
+        p.rect_stroke(
+            lp,
+            CornerRadius::same(20),
+            Stroke::new(1.0_f32, pal.card_line),
+            StrokeKind::Inside,
+        );
+        let cw = (lp.width() - 20.0) / 7.0;
+        let ch = (lp.height() - 20.0) / 4.0;
+        for i in 0..26usize {
+            let letter = (b'A' + i as u8) as char;
+            let cx = lp.left() + 10.0 + (i % 7) as f32 * cw + cw * 0.5;
+            let cy = lp.top() + 10.0 + (i / 7) as f32 * ch + ch * 0.5;
+            label(
+                p,
+                pos2(cx, cy),
+                Align2::CENTER_CENTER,
+                &letter.to_string(),
+                theme::font_medium(17.0),
+                pal.text,
+                false,
+            );
+            hits.push((
+                Rect::from_center_size(pos2(cx, cy), vec2(cw, ch)),
+                Hit::DrawerLetter(i),
+            ));
+        }
+    }
 }
 
 // ------------------------------------------------------------ hidden space
@@ -637,15 +807,10 @@ fn draw_hidden(
             Hit::HiddenMenu,
         ));
 
-        // Real hidden apps first (their indices match `hidden_apps`), then
-        // the demo items of the reconstructed model.
-        let mut entries: Vec<(Option<App>, String, u32)> = Vec::new();
-        for ha in &app.hidden_apps {
-            entries.push((Some(*ha), ha.name().to_string(), ha.accent()));
-        }
-        for it in app.hidden.items() {
-            entries.push((None, it.name.clone(), it.accent));
-        }
+        // One merged list shared with input routing, so long-press indices
+        // always match what is drawn: real hidden apps first, then the
+        // desktop-catalog entries, then the reconstructed demo items.
+        let entries = app.hidden_entries();
         if entries.is_empty() {
             label(
                 p,
@@ -667,26 +832,43 @@ fn draw_hidden(
             );
         }
         let slot_w = rect.width() / COLS as f32;
-        for (i, (oa, name, accent)) in entries.iter().enumerate() {
+        for (i, entry) in entries.iter().enumerate() {
             let cx = rect.left() + (i % COLS) as f32 * slot_w + slot_w * 0.5;
             let cy = rect.top() + 96.0 + (i / COLS) as f32 * 96.0 + 32.0;
             let s = Rect::from_center_size(pos2(cx, cy), vec2(56.0, 56.0));
-            match oa {
-                Some(ha) => ha.draw(p, s),
-                None => {
-                    let letter = name
+            let name: String = match entry {
+                HiddenEntry::Mock(mock) => {
+                    let package = app.resolved_package(*mock);
+                    draw_slot_icon(app, p, s, package, Some(*mock), mock.name());
+                    mock.name().to_string()
+                }
+                HiddenEntry::Real(real) => {
+                    draw_slot_icon(
+                        app,
+                        p,
+                        s,
+                        Some(real.package.as_str()),
+                        targets::app_for_package(&real.package),
+                        &real.label,
+                    );
+                    real.label.clone()
+                }
+                HiddenEntry::Demo(item) => {
+                    let letter = item
+                        .name
                         .chars()
                         .next()
                         .map(|c| c.to_string())
                         .unwrap_or_default();
-                    icons::draw_letter(p, s, *accent, &letter);
+                    icons::draw_letter(p, s, item.accent, &letter);
+                    item.name.clone()
                 }
-            }
+            };
             label(
                 p,
                 pos2(cx, cy + 40.0),
                 Align2::CENTER_CENTER,
-                name,
+                &name,
                 theme::font(13.0),
                 theme::white(0.86 * a),
                 false,
@@ -934,7 +1116,8 @@ fn draw_shelf(
         let cy = y + 28.0;
         let s = Rect::from_center_size(pos2(cx, cy), vec2(52.0, 52.0));
         if i == 0 {
-            App::Calculator.draw(p, s);
+            let package = app.resolved_package(App::Calculator);
+            draw_slot_icon(app, p, s, package, Some(App::Calculator), "Calculator");
         } else {
             icons::disc(p, s.center(), 26.0, theme::rgb(0xF2F2F4));
             match i {
@@ -979,23 +1162,42 @@ fn draw_shelf(
     );
     y += 44.0;
     let row_h = 78.0;
-    for (i, a) in icons::SHELF_RECENTS.iter().enumerate() {
+    let recents = app.shelf_recents();
+    if recents.is_empty() {
+        label(
+            p,
+            pos2(left, y + 4.0),
+            Align2::LEFT_TOP,
+            "Nothing here yet - open an app and it shows up",
+            theme::font(14.0),
+            pal.text_dim,
+            false,
+        );
+    }
+    for (i, recent) in recents.iter().enumerate() {
         let cx = left + ((i % 5) as f32 + 0.5) * slot;
         let cy = y + (i / 5) as f32 * row_h + 24.0;
         let s = Rect::from_center_size(pos2(cx, cy), vec2(48.0, 48.0));
-        a.draw(p, s);
+        draw_slot_icon(
+            app,
+            p,
+            s,
+            recent.package.as_deref(),
+            recent.mock,
+            &recent.label,
+        );
         label(
             p,
             pos2(cx, cy + 34.0),
             Align2::CENTER_CENTER,
-            a.name(),
+            &recent.label,
             theme::font(12.0),
             theme::with_alpha(pal.text, 0.85),
             false,
         );
         hits.push((s.expand(10.0), Hit::ShelfApp(i)));
     }
-    y += 2.0 * row_h + 6.0 + 26.0;
+    y += recents.len().div_ceil(5).max(1) as f32 * row_h + 6.0 + 26.0;
 
     // --- Parking Location ----------------------------------------------
     let hc = pos2(left + 14.0, y + 14.0);
@@ -1020,49 +1222,84 @@ fn draw_shelf(
         false,
     );
     y += 56.0;
-    label(
-        p,
-        pos2(left, y),
-        Align2::LEFT_TOP,
-        "Parking duration: 0 minutes",
-        theme::font(16.0),
-        pal.text,
-        false,
-    );
-    y += 34.0;
-    let map = Rect::from_min_size(pos2(left, y), vec2(w, 150.0));
-    icons::rrect(p, map, 12.0, theme::rgb(0x26262B));
-    let road = theme::white(0.10);
-    icons::line(
-        p,
-        pos2(map.left() + 20.0, map.top() + 56.0),
-        pos2(map.right() - 20.0, map.top() + 44.0),
-        10.0,
-        road,
-    );
-    icons::line(
-        p,
-        pos2(map.left() + 20.0, map.top() + 110.0),
-        pos2(map.right() - 20.0, map.top() + 120.0),
-        8.0,
-        road,
-    );
-    icons::line(
-        p,
-        pos2(map.center().x - 30.0, map.top() + 10.0),
-        pos2(map.center().x + 6.0, map.bottom() - 10.0),
-        8.0,
-        road,
-    );
-    let pin = pos2(map.center().x + 6.0, map.center().y);
-    icons::poly(
-        p,
-        &[pin + vec2(-9.0, -2.0), pin + vec2(9.0, -2.0), pin + vec2(0.0, 16.0)],
-        theme::rgb(0x2196F3),
-    );
-    icons::disc(p, pin, 10.0, theme::rgb(0x2196F3));
-    icons::disc(p, pin, 4.0, Color32::WHITE);
-    y += 150.0 + 12.0;
+    if platform::is_android() {
+        // No fake map on a device: live parking detection needs location
+        // access, which this build does not request.
+        let note = Rect::from_min_size(pos2(left, y), vec2(w, 102.0));
+        icons::rrect(p, note, 12.0, theme::with_alpha(pal.text, 0.05));
+        label(
+            p,
+            pos2(left + 14.0, y + 24.0),
+            Align2::LEFT_CENTER,
+            "Reconstructed from the stock Shelf",
+            theme::font(14.0),
+            theme::with_alpha(pal.text, 0.85),
+            false,
+        );
+        label(
+            p,
+            pos2(left + 14.0, y + 50.0),
+            Align2::LEFT_CENTER,
+            "Live tracking needs location access -",
+            theme::font(12.0),
+            pal.text_dim,
+            false,
+        );
+        label(
+            p,
+            pos2(left + 14.0, y + 70.0),
+            Align2::LEFT_CENTER,
+            "which this build doesn't request yet.",
+            theme::font(12.0),
+            pal.text_dim,
+            false,
+        );
+        y += 102.0 + 12.0;
+    } else {
+        label(
+            p,
+            pos2(left, y),
+            Align2::LEFT_TOP,
+            "Parking duration: 0 minutes",
+            theme::font(16.0),
+            pal.text,
+            false,
+        );
+        y += 34.0;
+        let map = Rect::from_min_size(pos2(left, y), vec2(w, 150.0));
+        icons::rrect(p, map, 12.0, theme::rgb(0x26262B));
+        let road = theme::white(0.10);
+        icons::line(
+            p,
+            pos2(map.left() + 20.0, map.top() + 56.0),
+            pos2(map.right() - 20.0, map.top() + 44.0),
+            10.0,
+            road,
+        );
+        icons::line(
+            p,
+            pos2(map.left() + 20.0, map.top() + 110.0),
+            pos2(map.right() - 20.0, map.top() + 120.0),
+            8.0,
+            road,
+        );
+        icons::line(
+            p,
+            pos2(map.center().x - 30.0, map.top() + 10.0),
+            pos2(map.center().x + 6.0, map.bottom() - 10.0),
+            8.0,
+            road,
+        );
+        let pin = pos2(map.center().x + 6.0, map.center().y);
+        icons::poly(
+            p,
+            &[pin + vec2(-9.0, -2.0), pin + vec2(9.0, -2.0), pin + vec2(0.0, 16.0)],
+            theme::rgb(0x2196F3),
+        );
+        icons::disc(p, pin, 10.0, theme::rgb(0x2196F3));
+        icons::disc(p, pin, 4.0, Color32::WHITE);
+        y += 150.0 + 12.0;
+    }
 
     let c1 = left + w * 0.25;
     let c2 = left + w * 0.75;
@@ -1106,6 +1343,27 @@ fn draw_shelf(
             Hit::ShelfCard(i),
         ));
         y += 22.0 + 26.0;
+    }
+    if app.cards.cards().is_empty() {
+        label(
+            p,
+            pos2(left, y),
+            Align2::LEFT_TOP,
+            "No cards yet.",
+            theme::font(13.0),
+            theme::with_alpha(pal.text, 0.75),
+            false,
+        );
+        label(
+            p,
+            pos2(left, y + 20.0),
+            Align2::LEFT_TOP,
+            "Card publishers only connect in the desktop preview.",
+            theme::font(12.0),
+            pal.text_faint,
+            false,
+        );
+        y += 46.0;
     }
 
     // --- New note ------------------------------------------------------
@@ -1156,7 +1414,7 @@ fn draw_recents(
     let card_h = (rect.bottom() - 240.0 - card_top).max(140.0);
     let pitch = card_w + 24.0;
     let carousel = app.carousel.min(app.tasks.len() - 1);
-    let mut bottom_icons: Vec<(usize, App)> = Vec::new();
+    let mut bottom_icons: Vec<usize> = Vec::new();
 
     for (i, task) in app.tasks.iter().enumerate() {
         let bx = rect.center().x - card_w * 0.5 + (i as f32 - carousel as f32) * pitch
@@ -1197,7 +1455,7 @@ fn draw_recents(
             .x;
         let x0 = card.center().x - (35.0 + 8.0 + tw) * 0.5;
         let hdr = pos2(x0 + 17.5, card.top() - 26.0);
-        task.app.draw(p, Rect::from_center_size(hdr, vec2(35.0, 35.0)));
+        draw_task_icon(app, p, Rect::from_center_size(hdr, vec2(35.0, 35.0)), task);
         label(
             p,
             pos2(x0 + 43.0, hdr.y),
@@ -1208,7 +1466,9 @@ fn draw_recents(
             false,
         );
 
-        // Fake app screenshot.
+        // Card body: real launches get an honest icon card (no live
+        // snapshot exists for third-party processes); demo tasks keep the
+        // stylised window reconstruction.
         let cp = p.with_clip_rect(card);
         icons::rrect(
             &cp,
@@ -1216,40 +1476,76 @@ fn draw_recents(
             0.0,
             theme::with_alpha(theme::rgb(task.accent), 0.25 * fade),
         );
-        task.app
-            .draw(&cp, Rect::from_center_size(pos2(card.left() + 20.0, card.top() + 15.0), vec2(20.0, 20.0)));
+        draw_task_icon(
+            app,
+            &cp,
+            Rect::from_center_size(pos2(card.left() + 20.0, card.top() + 15.0), vec2(20.0, 20.0)),
+            task,
+        );
         icons::dots3h(&cp, pos2(card.right() - 34.0, card.top() + 15.0), 8.0, 2.0, theme::white(0.3 * fade));
-        let line = |yy: f32, wf: f32, h: f32| {
-            Rect::from_min_size(
-                pos2(card.left() + 18.0, card.top() + yy),
-                vec2((card_w - 36.0) * wf, h),
-            )
-        };
-        icons::rrect(&cp, line(58.0, 0.55, 14.0), 4.0, theme::white(0.12 * fade));
-        icons::rrect(&cp, line(86.0, 0.75, 8.0), 4.0, theme::white(0.08 * fade));
-        icons::rrect(&cp, line(104.0, 0.68, 8.0), 4.0, theme::white(0.08 * fade));
-        icons::rrect(&cp, line(122.0, 0.60, 8.0), 4.0, theme::white(0.08 * fade));
-        icons::rrect(
-            &cp,
-            Rect::from_min_size(
-                pos2(card.left() + 18.0, card.top() + 150.0),
-                vec2(card_w - 36.0, (card_h - 240.0).max(40.0)),
-            ),
-            8.0,
-            theme::white(0.05 * fade),
-        );
-        icons::rrect(
-            &cp,
-            Rect::from_center_size(pos2(card.center().x, card.bottom() - 22.0), vec2(card_w * 0.4, 6.0)),
-            3.0,
-            theme::white(0.10 * fade),
-        );
+        if task.package.is_some() {
+            let icon_c = pos2(card.center().x, card.top() + card_h * 0.38);
+            draw_task_icon(app, &cp, Rect::from_center_size(icon_c, vec2(110.0, 110.0)), task);
+            label(
+                &cp,
+                pos2(card.center().x, icon_c.y + 84.0),
+                Align2::CENTER_CENTER,
+                &task.title,
+                theme::font_medium(18.0),
+                theme::white(0.92 * fade),
+                false,
+            );
+            label(
+                &cp,
+                pos2(card.center().x, icon_c.y + 110.0),
+                Align2::CENTER_CENTER,
+                "No live snapshot for third-party launchers",
+                theme::font(11.5),
+                theme::white(0.45 * fade),
+                false,
+            );
+            label(
+                &cp,
+                pos2(card.left() + 18.0, card.bottom() - 24.0),
+                Align2::LEFT_CENTER,
+                &task.caption,
+                theme::font(11.0),
+                theme::white(0.35 * fade),
+                false,
+            );
+        } else {
+            let line = |yy: f32, wf: f32, h: f32| {
+                Rect::from_min_size(
+                    pos2(card.left() + 18.0, card.top() + yy),
+                    vec2((card_w - 36.0) * wf, h),
+                )
+            };
+            icons::rrect(&cp, line(58.0, 0.55, 14.0), 4.0, theme::white(0.12 * fade));
+            icons::rrect(&cp, line(86.0, 0.75, 8.0), 4.0, theme::white(0.08 * fade));
+            icons::rrect(&cp, line(104.0, 0.68, 8.0), 4.0, theme::white(0.08 * fade));
+            icons::rrect(&cp, line(122.0, 0.60, 8.0), 4.0, theme::white(0.08 * fade));
+            icons::rrect(
+                &cp,
+                Rect::from_min_size(
+                    pos2(card.left() + 18.0, card.top() + 150.0),
+                    vec2(card_w - 36.0, (card_h - 240.0).max(40.0)),
+                ),
+                8.0,
+                theme::white(0.05 * fade),
+            );
+            icons::rrect(
+                &cp,
+                Rect::from_center_size(pos2(card.center().x, card.bottom() - 22.0), vec2(card_w * 0.4, 6.0)),
+                3.0,
+                theme::white(0.10 * fade),
+            );
+        }
 
         if fade > 0.4 {
             hits.push((card, Hit::Task(i)));
         }
         if bottom_icons.len() < 6 {
-            bottom_icons.push((i, task.app));
+            bottom_icons.push(i);
         }
     }
 
@@ -1259,7 +1555,7 @@ fn draw_recents(
         let total = n as f32 * 3.5 + (n - 1) as f32 * 7.0;
         let x0 = rect.center().x - total * 0.5;
         for k in 0..n {
-            let active = bottom_icons[k].0 == carousel;
+            let active = bottom_icons[k] == carousel;
             icons::rrect(
                 p,
                 Rect::from_min_size(pos2(x0 + k as f32 * 10.5, dots_y - 1.75), vec2(3.5, 3.5)),
@@ -1270,10 +1566,12 @@ fn draw_recents(
     }
     if n > 0 {
         let spacing = 56.0f32.min((rect.width() - 80.0) / n as f32);
-        for (k, (ti, app)) in bottom_icons.iter().enumerate() {
+        for (k, ti) in bottom_icons.iter().enumerate() {
             let cx = rect.center().x + (k as f32 - (n as f32 - 1.0) * 0.5) * spacing;
             let s = Rect::from_center_size(pos2(cx, rect.bottom() - 152.0), vec2(35.0, 35.0));
-            app.draw(p, s);
+            if let Some(task) = app.tasks.get(*ti) {
+                draw_task_icon(app, p, s, task);
+            }
             hits.push((s.expand(8.0), Hit::TaskIcon(*ti)));
         }
     }
@@ -1428,7 +1726,7 @@ fn draw_shade(
             pos2(gx + col as f32 * (gw + 12.0), y0 + 116.0 + row as f32 * (th + 12.0)),
             vec2(gw, th),
         );
-        let on = app.tiles.get(i).copied().unwrap_or(false);
+        let on = app.tile_on(i);
         let bg = if on {
             theme::with_alpha(pal.accent, 0.90 * a)
         } else {
@@ -1462,7 +1760,11 @@ fn draw_shade(
         p,
         pos2(gx, y0 + SHADE_BRIGHT_TOP + 8.0),
         Align2::LEFT_CENTER,
-        "Brightness",
+        if platform::is_android() {
+            "Brightness \u{00B7} app window"
+        } else {
+            "Brightness"
+        },
         theme::font(12.0),
         theme::white(0.55 * a),
         false,
@@ -1520,29 +1822,52 @@ fn draw_shade(
         theme::white(0.9 * a),
         false,
     );
-    let clr = Rect::from_center_size(pos2(panel.right() - 52.0, ny), vec2(66.0, 26.0));
-    icons::rrect(p, clr, 13.0, theme::white(0.08 * a));
-    label(
-        p,
-        clr.center(),
-        Align2::CENTER_CENTER,
-        "Clear all",
-        theme::font(11.0),
-        theme::white(0.7 * a),
-        false,
-    );
-    hits.push((clr, Hit::ShadeClearAll));
-    ny += 24.0;
-    if app.notifs.is_empty() {
+    if !app.notifs.is_empty() {
+        let clr = Rect::from_center_size(pos2(panel.right() - 52.0, ny), vec2(66.0, 26.0));
+        icons::rrect(p, clr, 13.0, theme::white(0.08 * a));
         label(
             p,
-            pos2(panel.center().x, ny + 44.0),
+            clr.center(),
             Align2::CENTER_CENTER,
-            "No notifications",
-            theme::font(13.0),
-            theme::white(0.4 * a),
+            "Clear all",
+            theme::font(11.0),
+            theme::white(0.7 * a),
             false,
         );
+        hits.push((clr, Hit::ShadeClearAll));
+    }
+    ny += 24.0;
+    if app.notifs.is_empty() {
+        if platform::is_android() {
+            label(
+                p,
+                pos2(panel.center().x, ny + 40.0),
+                Align2::CENTER_CENTER,
+                "Notification access is reserved for the system launcher",
+                theme::font(13.0),
+                theme::white(0.4 * a),
+                false,
+            );
+            label(
+                p,
+                pos2(panel.center().x, ny + 62.0),
+                Align2::CENTER_CENTER,
+                "- this panel stays a reconstruction",
+                theme::font(11.5),
+                theme::white(0.3 * a),
+                false,
+            );
+        } else {
+            label(
+                p,
+                pos2(panel.center().x, ny + 44.0),
+                Align2::CENTER_CENTER,
+                "No notifications",
+                theme::font(13.0),
+                theme::white(0.4 * a),
+                false,
+            );
+        }
     }
     for (i, n) in app.notifs.iter().take(3).enumerate() {
         let nr = Rect::from_min_size(

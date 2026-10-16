@@ -3,11 +3,46 @@
 //! Mirrors the small state object REA recovered from the analyzed launcher
 //! (`HiddenSpaceModel`): a boolean flag controls whether the space is gated
 //! by a password, plus the list of hidden items.
+//!
+//! On a device the primary rows are real installed apps ([`HiddenReal`],
+//! hidden by holding them in the drawer); [`HiddenItem`] rows are the
+//! reconstructed demo entries that only exist in the desktop preview.
+
+use crate::icons::App;
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub struct HiddenItem {
     pub name: String,
     pub accent: u32,
+}
+
+/// A real, device-installed app that was hidden from the drawer.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct HiddenReal {
+    pub package: String,
+    pub activity: String,
+    pub label: String,
+}
+
+/// One row of the Hidden Space listing, in display order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum HiddenEntry {
+    /// A demo-catalog app (desktop preview only).
+    Mock(App),
+    /// A real installed app hidden from the drawer.
+    Real(HiddenReal),
+    /// One of the reconstructed demo items.
+    Demo(HiddenItem),
+}
+
+/// Display-order merge shared by rendering and input routing: the same
+/// indices must be used on both sides, so both call this one function.
+pub fn merge_hidden(mock: &[App], real: &[HiddenReal], demo: &[HiddenItem]) -> Vec<HiddenEntry> {
+    let mut entries = Vec::with_capacity(mock.len() + real.len() + demo.len());
+    entries.extend(real.iter().cloned().map(HiddenEntry::Real));
+    entries.extend(mock.iter().copied().map(HiddenEntry::Mock));
+    entries.extend(demo.iter().cloned().map(HiddenEntry::Demo));
+    entries
 }
 
 #[derive(Clone, Debug)]
@@ -76,6 +111,11 @@ impl HiddenSpace {
         &self.items
     }
 
+    /// Remove every reconstructed demo item (a device build shows none).
+    pub fn clear_items(&mut self) {
+        self.items.clear();
+    }
+
     /// Add an item; returns `false` when an item with that name exists.
     pub fn hide_item(&mut self, name: &str, accent: u32) -> bool {
         if self.items.iter().any(|i| i.name == name) {
@@ -134,5 +174,42 @@ mod tests {
         let removed = h.unhide_item("Private").expect("item present");
         assert_eq!(removed.name, "Private");
         assert!(h.unhide_item("Private").is_none());
+    }
+
+    #[test]
+    fn clear_items_empties_the_demo_list() {
+        let mut h = HiddenSpace::new();
+        assert!(!h.items().is_empty());
+        h.clear_items();
+        assert!(h.items().is_empty());
+        assert!(h.is_unlocked());
+    }
+
+    #[test]
+    fn merge_orders_real_then_mock_then_demo() {
+        let mock = vec![App::Camera, App::Netflix];
+        let real = vec![HiddenReal {
+            package: "com.example.vault".to_owned(),
+            activity: "com.example.vault.Main".to_owned(),
+            label: "Vault".to_owned(),
+        }];
+        let demo = vec![HiddenItem {
+            name: "Diary".to_owned(),
+            accent: 0x123456,
+        }];
+        let entries = merge_hidden(&mock, &real, &demo);
+        assert_eq!(entries.len(), 4);
+        assert!(matches!(&entries[0], HiddenEntry::Real(r) if r.package == "com.example.vault"));
+        assert!(matches!(&entries[1], HiddenEntry::Mock(App::Camera)));
+        assert!(matches!(&entries[2], HiddenEntry::Mock(App::Netflix)));
+        assert!(matches!(&entries[3], HiddenEntry::Demo(d) if d.name == "Diary"));
+    }
+
+    #[test]
+    fn merge_indices_are_stable_and_empty_safe() {
+        let entries = merge_hidden(&[], &[], &[]);
+        assert!(entries.is_empty());
+        let only_mock = merge_hidden(&[App::Chrome], &[], &[]);
+        assert!(matches!(&only_mock[0], HiddenEntry::Mock(App::Chrome)));
     }
 }

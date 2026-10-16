@@ -9,10 +9,12 @@ Launcher Lab reconstructs the interaction model that a static reverse-engineerin
 `*InputConsumer` gesture-routing state machine, the Shelf card/channel contract, the Hidden
 Space flag model, and the recents/Overview flow.
 
-> **Status:** demo (v0.3.0). It is a real, installable launcher-shaped app — every icon opens
-> a full-screen reconstructed preview of that app (so the demo reads everywhere), the recents
-> list is simulated, and the APK is signed with a project key (built and signed entirely by
-> GitHub Actions).
+> **Status:** v0.4.0 — real device integration. On Android every surface is backed by the
+> phone itself: the drawer lists the real installed apps, taps launch the real apps, icons and
+> the wallpaper stream in from the system, and the shade reads live toggle states (a normal
+> app cannot flip radios on Android 10+, so tiles open the real settings screens). The desktop
+> build keeps the bundled demo catalog. The APK is signed with a project key and built
+> entirely by GitHub Actions.
 
 ## Download
 
@@ -42,12 +44,16 @@ clock/weather widget with the signature red leading digit, the Google pill, the 
 `^` caret + page dots are all drawn live with `egui` primitives — no image assets ship with
 the app.
 
-Every app gets an in-app **demo preview**: tapping an icon (home, dock, drawer, folder, shelf,
-recents or a notification) opens a full-screen mock with a zoom-reveal animation — Chrome
-with an address bar and result rows, Messages with chat bubbles, Camera with a viewfinder and
-shutter, Gallery with a photo grid, Play Store with Install rows, Music with a player, plus
-Weather, Clock, Calculator, Maps and video surfaces; everything else gets a skeleton page.
-Back via the chevron or a left-edge swipe. A first-run card maps every gesture.
+On a device, tapping an app (home, dock, drawer, folder, shelf or a recents card) launches the
+real installed app — the drawer is your phone's actual app list, and the home wallpaper is the
+real system wallpaper with parallax. Icons are read from the system at runtime; the drawn set
+in `src/icons.rs` remains the fallback while a texture loads. The desktop dev build (no
+Android) keeps the in-app **demo previews**: tapping an icon opens a full-screen mock with a
+zoom-reveal animation — Chrome with an address bar and result rows, Messages with chat bubbles,
+Camera with a viewfinder and shutter, Gallery with a photo grid, Play Store with Install rows,
+Music with a player, plus Weather, Clock, Calculator, Maps and video surfaces; everything else
+gets a skeleton page. Back via the chevron or a left-edge swipe. A first-run card maps every
+gesture.
 
 | Gesture / UI element | Behaviour (reconstructed from) |
 | --- | --- |
@@ -60,24 +66,30 @@ Back via the chevron or a left-edge swipe. A first-run card maps every gesture.
 | Bottom-left corner touch | Assistant zone (`AssistantTouchConsumer`) |
 | Drawer: swipe **right** | **Hidden Space**; swipe down closes; drag scrolls the grid |
 | Hidden Space: hold the ring | Unlock; hold the ⋮ menu glyph to toggle the password flag (`HiddenSpaceModel`) |
-| Hidden items: hold an icon | Unhide (`unhideItem`); tap = open demo |
-| Drawer: hold an app | Hide it (moves to Hidden Space); hold it there to restore it |
-| Swipe **down from the status bar** | **Notification shade**: clock, quick tiles, brightness, notifications |
-| Shade: tap a tile / drag the slider | Quick-setting toggles; the brightness slider dims the whole surface |
-| Tap an app or a notification | In-app demo preview; back = chevron tap or left-edge swipe |
-| Recents: swipe up on a card | Dismiss the task; drag across = carousel; Clear all empties it |
+| Hidden items: hold an icon | Restore it to the drawer; tap = open (real app on device, preview on desktop) |
+| Drawer: hold an app | Hide it (a real package on device); hold it in Hidden Space to restore it |
+| Swipe **down from the status bar** | **Notification shade**: clock, quick tiles with live states, brightness, notifications |
+| Shade: tap a tile / drag the slider | Tiles open the real settings screens (device) or toggle demo tiles (desktop); the slider dims the launcher surface |
+| Tap an app | Launches the real app (device) or the demo preview (desktop) |
+| Recents: swipe up on a card | Dismiss the task; drag across = carousel; Clear all empties it. Cards are the apps you really launched |
 | Shelf: tap a card | `getCard` readout; hold a memo → `deleteCard`; "+ New note" → `postCard` |
 | Hold empty home | Light/dark chrome toggle (dark pill ↔ light pill) |
 | Double-tap empty home | Device-locked overlay (`DeviceLockedInputConsumer`); swipe up or tap to unlock |
 
-The shelf's Toolbox / Recent apps / Parking Location cards mirror the stock 4.4.8 shelf,
-followed by live cards from the reconstructed `CardProvider` channel store
-(`weather.home`, `health.steps`, `music.now`, `memo.*`).
+The shelf's Toolbox launches the matching real apps on device (Calculator, Camera, Clock,
+Files, Chrome). Recent apps lists what you actually launched, newest first, and re-taps
+relaunch. Parking Location is an honest reconstruction on device (live tracking would need
+location access this build does not request); the desktop preview keeps the full painted map.
+Below them, cards come from the reconstructed `CardProvider` channel store: the `memo`
+channel works on every platform ("+ New note" / hold a memo to delete), while the
+`weather` / `health` / `music` publishers post in the desktop preview.
 
 Unit tests cover the pure model: gesture classification & release outcomes
 (`src/model/state.rs`), pager physics (`src/model/pager.rs`), the card contract
-(`src/model/shelf.rs`), the hidden-space flag model (`src/model/hidden.rs`), and the
-UTC civil-date clock math (`src/clock.rs`).
+(`src/model/shelf.rs`), the hidden-space model including real hidden packages
+(`src/model/hidden.rs`), the UTC civil-date clock math (`src/clock.rs`), the
+app→component target map (`src/targets.rs`), the loader protocol (`src/loader.rs`),
+and platform value validation (`src/platform.rs`).
 
 ## Architecture
 
@@ -86,17 +98,20 @@ src/
 ├── lib.rs        crate root + desktop entry
 ├── main.rs       desktop binary (`cargo run`)
 ├── android.rs    Android entry (`android_main`, NativeActivity)
-├── app.rs        state, input routing, gesture lifecycle
+├── app.rs        state, input routing, gesture lifecycle, device data pipeline
 ├── views.rs      painter-only rendering of every surface + hit zones
-├── icons.rs      every app icon, composed from primitives
-├── wallpaper.rs  procedural wallpaper (painterly clouds over indigo)
+├── icons.rs      app-icon painters (fallback for packages without a texture)
+├── platform.rs   the JNI backend: installed apps, launching, icons, wallpaper, system state
+├── loader.rs     single worker thread between platform (JNI) and the UI
+├── targets.rs    reconstructed home/dock entries → real installed components
+├── wallpaper.rs  procedural wallpaper (desktop + fallback while the real one loads)
 ├── clock.rs      wall-clock time (`localtime_r` on Android, UTC civil-date on host)
 ├── theme.rs      palette + bundled Roboto families + animation helpers
 └── model/        pure logic, unit-tested
     ├── state.rs  input-consumer routing (the reconstructed state machine)
     ├── pager.rs  home-screen pager
     ├── shelf.rs  CardContract-style store
-    └── hidden.rs Hidden Space model
+    └── hidden.rs Hidden Space model (demo items + real hidden packages)
 assets/
 └── fonts/        Roboto Regular/Light/Medium (Apache-2.0, see LICENSE.txt)
 ```
@@ -127,10 +142,23 @@ targetSdk 34, `build_targets = ["aarch64-linux-android"]`, portrait, fullscreen 
 
 ## Limitations
 
+Some things are impossible for an unprivileged app on Android 10+, and the build stays honest
+about them instead of faking them:
+
+* **Notifications** need a `NotificationListenerService`, which only the system picker can
+  grant; on a device the shade's notification area stays visibly empty with an explanation
+  (the desktop build shows demo notifications).
+* **Recent-app snapshots** need privileged APIs: the Overview shows your real launches (icon,
+  title, caption) with an explicit "no live snapshot" note instead of a counterfeit screenshot.
+* **Quick-setting toggles** cannot flip Wi-Fi/Bluetooth/airplane from a normal app; tiles read
+  the live state and open the corresponding system settings screen. The flashlight tile is
+  system-reserved and never claims to be on.
+* The **brightness slider** dims the launcher's own surface, not the system brightness
+  (that needs `WRITE_SETTINGS`, reserved for system apps).
+* The built APK requests `ACCESS_WIFI_STATE` and `BLUETOOTH` — used solely to read the live
+  tile states. Nothing else is collected, and no other permission is requested.
 * Signed with a project-generated key (stable across builds, so in-place updates work), but
   it is not a Play-ready signing setup.
-* Tiles, tasks and cards are demo data; launching opens reconstructed in-app previews, not
-  real apps (that would need the system's privileged recents/task APIs).
 * Only `arm64-v8a` is built — fine for the OnePlus 7, not for old 32-bit devices.
 * The launcher does not register as a HOME replacement on purpose (safe to try).
 

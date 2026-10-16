@@ -16,6 +16,8 @@ pub mod platform;
 mod app;
 mod clock;
 mod icons;
+mod loader;
+mod targets;
 mod theme;
 mod views;
 mod wallpaper;

@@ -1,6 +1,6 @@
 [package]
 name = "launcher-lab"
-version = "0.3.0"
+version = "0.4.0"
 edition = "2021"
 rust-version = "1.81"
 authors = ["rajbhx"]
@@ -45,3 +45,12 @@ theme = "@android:style/Theme.DeviceDefault.NoActionBar.Fullscreen"
 
 [package.metadata.android.application.activity]
 orientation = "portrait"
+
+# Normal (install-time) permissions, used by the shade's live tile states.
+# These only read Wi-Fi/Bluetooth state; nothing here changes radios or
+# collects data.
+[[package.metadata.android.uses_permission]]
+name = "android.permission.ACCESS_WIFI_STATE"
+
+[[package.metadata.android.uses_permission]]
+name = "android.permission.BLUETOOTH"
