@@ -123,9 +123,27 @@ rate. The UI is 100% custom-painted: rounded tiles, task cards, shelf, unlock ri
 notification shade, wallpaper — no widgets, no bitmaps. Frame-rate independent exponential
 animations keep transitions smooth.
 
-## How it's built (GitHub Actions)
+## How it's built
 
-Two workflows, zero local builds:
+### Locally (Windows host)
+
+`scripts/build-apk.ps1` runs the same pipeline on a local machine: it locates the Android
+SDK (build-tools + platform) and NDK, points `aarch64-linux-android` at the NDK clang
+wrapper, runs `cargo apk build --release --lib`, then `zipalign -p 4` and `apksigner sign`
+with the project keystore (read from `-KeystoreDir`, default `C:\Users\raj\launcher-lab-keys`,
+never written into the repo), and finally re-verifies the signature and prints the SHA-256.
+
+```powershell
+pwsh -File scripts\build-apk.ps1              # signed, aligned APK
+pwsh -File scripts\build-apk.ps1 -SkipSign    # unsigned, for inspection
+```
+
+Prerequisites: Rust stable + `cargo install cargo-apk`, a JDK on `JAVA_HOME`, Android
+build-tools + platform 34 and an NDK (verified with NDK 26.1 / build-tools 34.0.0 on Java 21).
+
+### On CI (GitHub Actions)
+
+Two workflows, zero local builds required:
 
 * **`.github/workflows/ci.yml`** — `cargo check --all-targets` + `cargo test` on
   `ubuntu-24.04` for every push: model tests and host compilation.

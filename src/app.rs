@@ -56,6 +56,16 @@ const ICON_TEXTURE_EDGE: u32 = 144;
 const LOADER_REPLIES_PER_FRAME: usize = 6;
 /// Retry cadence for the installed-apps query while it keeps failing.
 const APPS_RETRY_SECONDS: f64 = 6.0;
+/// How many times the system wallpaper is asked for before the painted
+/// fallback stays in place (a live wallpaper can be briefly unavailable).
+const WALLPAPER_MAX_ATTEMPTS: u32 = 3;
+/// Seconds to wait between wallpaper attempts.
+const WALLPAPER_RETRY_SECONDS: f64 = 2.5;
+/// Hard cap on the decoded wallpaper bitmap (physical pixels per side): an
+/// overscan of a phone screen is plenty, and the cap keeps the allocation
+/// bounded on tablets and unusual densities.
+const WALLPAPER_MAX_WIDTH: u32 = 2560;
+const WALLPAPER_MAX_HEIGHT: u32 = 3840;
 
 /// One entry of the recents stack.
 #[derive(Clone, Debug)]
@@ -217,7 +227,10 @@ pub struct LauncherLab {
     resolved_targets: HashMap<App, RealApp>,
     /// The live system wallpaper (device), drawn with overscan + parallax.
     pub wallpaper_tex: Option<egui::TextureHandle>,
-    wallpaper_requested: bool,
+    /// How many times the system wallpaper has been requested (device only).
+    wallpaper_attempts: u32,
+    /// Time of the last wallpaper request, for the retry backoff.
+    wallpaper_attempt_t: f32,
     loader: Option<Loader>,
     /// Real apps hidden from the drawer.
     pub hidden_real: Vec<HiddenReal>,
@@ -386,7 +399,8 @@ impl LauncherLab {
             apps_error_toasted: false,
             resolved_targets: HashMap::new(),
             wallpaper_tex: None,
-            wallpaper_requested: false,
+            wallpaper_attempts: 0,
+            wallpaper_attempt_t: 0.0,
             loader,
             hidden_real: Vec::new(),
             search_letter: None,

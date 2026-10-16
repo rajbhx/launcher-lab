@@ -18,6 +18,10 @@ fn android_main(app: AndroidApp) {
     // Android system services (PackageManager, WallpaperManager, ...).
     crate::platform::set_android();
 
+    // Hand the app's private data directory to the state store so hidden apps
+    // and the recents list survive an OS-initiated process kill.
+    crate::store::set_dir(app.internal_data_path());
+
     // Explicitly request the glow (OpenGL ES) backend with vsync: on Android
     // this drives the NativeActivity's hardware-accelerated EGL surface.
     let options = eframe::NativeOptions {

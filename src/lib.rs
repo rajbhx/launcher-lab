@@ -17,6 +17,7 @@ mod app;
 mod clock;
 mod icons;
 mod loader;
+mod store;
 mod targets;
 mod theme;
 mod views;

@@ -125,7 +125,116 @@ private boolean disableHorizontalSwipe(MotionEvent motionEvent) {
 | Class: InputConsumer (base) | `ev_5c938e71a6d65c5562ad58238112f07ef719844c977b3cb9168726579dd405ce` |
 | Class: HiddenSpaceModel | `ev_52fbba398567638f7bd6a5f3ebe87621f35c0e8283e66eb00467d0a920571165` |
 
-## 7. Limitations (provider-stated)
+## 7. Second-pass verification (local toolchain, apktool 2.9.3)
+
+A second static pass was run on the same artifact (SHA-256 unchanged,
+`30cd82e306fc1e79c974a3eb2e4bf3e33151c97370965b79af144c184a1f05c5`) two ways: the local
+`apktool` 2.9.3 (`d --no-src`, 2,713 files decoded, `coverage: complete`) for the manifest
+census and the build-relevant resources, and a fresh REA pass (JADX provider +
+`rea-artifact-graph`) for code and inventory claims. The interactive REA session was briefly
+lost to a host restart and re-established; §1–§6 stand as recorded.
+
+| Second-pass Evidence | ID |
+|---|---|
+| Resource decode (apktool 2.9.3, manifest text) | `ev_a8c90c52131a3cebbe8646a127082fd2cc5e674f3bab9b052c54bd7e7e87220a` |
+| Package re-fetch (JADX) | `ev_3ddd2bfdf6f9561fd7d310bcc8271972353435fe33641ed8a35a55fda4356bcd` |
+| ZIP inventory | `ev_1a0b2d93b15d65e3c6f0c38fdd44e596047e40ac4dcb6893d0294657a6f3b655` |
+| `inspect_artifact` (complete) | `ev_073e8e0708872f037de02d62881fc2418d7986e7bcde91d858cf9eda2ba3e26c` |
+| Android application projection (`adp_862e7307…`) | `ev_57a7a33c85f73fc87f71612e1d9af67367a50320326da7e43c4abeb0f83ad917` |
+| Class: `net.oneplus.launcher.Launcher` (246 methods) | `ev_7573d4be237516a03bc955a6ce061d6a93ad550574affe408f2fbf563eade1ff` |
+| Class: `net.oneplus.launcher.LauncherApplication` (11 methods) | `ev_e53fbcc052e3ff688ccb8e1efaeee132e5928f481c755df7f646722cf3773553` |
+| Method: `Launcher.onCreate` | `ev_cfdf4c653a9a11c20cae007d45adf7ebd72e42c175ad8416f3b11a00eb6fb034` |
+| Class search: `Workspace` (16) | `ev_ad54d8e579bf3bd594aac9c8a58e6201e792e66da2dbd021aab136a4b8f62578` |
+| Class search: `net.oneplus.launcher.uioverrides` (28) | `ev_790b789234ba6d5a7652aea0e4409ccdf1f0e767b7ff80bd356922a3a7d1c84d` |
+
+**Census (exact, decoded manifest, 30,137 bytes):** 22 `<activity>` · 15 `<service>` ·
+15 `<receiver>` · 16 `<provider>` · 7 `<permission>` declarations · 56 `<uses-permission>` ·
+16 `<meta-data>` — independently reproducing the JADX-side census in §3.
+
+**Code / loader shape (REA inventory projection, `inventory_complete: true`):** the APK holds
+exactly 1 `AndroidManifest.xml`, 1 `resources.arsc`, 2 DEX files (`classes.dex`,
+`classes2.dex`), **0 native libraries**, 0 JavaScript bundles, and 3 v1 signing members
+(`META-INF/CERT.RSA|CERT.SF|MANIFEST.MF`). Runtime family: `dalvik-art` only; bridge
+candidates: none. (ZIP inventory sees central-directory entries only, so it cannot resolve
+the APK Signing Block — the v2/v3 signature status is not established by this projection.)
+**The APK ships no native code at all**: the launcher is DEX plus resources, and every
+privileged surface it leans on is provided by the OxygenOS platform rather than a bundled
+`.so`. Kotlin `*.kotlin_module` metadata lives under `kotlin/`.
+
+**Launcher core observed (second pass).** `net.oneplus.launcher.Launcher` carries 246
+methods and the appwidget/request constants (`APPWIDGET_HOST_ID`, `REQUEST_BIND_APPWIDGET`,
+`REQUEST_ENTER_HIDDEN_SPACE`, `REQUEST_CREATE_QUICK_PANEL_WIDGET`, …) plus the whole
+`bind*` model-update surface (`bindAllApplications`, `bindAppsAdded`, `bindWidgetsRestored`,
+`bindDeepShortcutMap`, `bindMinusOneScreenContent`). `LauncherApplication` is thin: 11
+methods, with `initGoogleAnalytics` / `initCrashlytics` analytics plumbing and a `DRY_RUN`
+flag; `onCreate` calls `setTheme(Themes.isDarkTheme(this) ? MainThemeDark : MainTheme)` and
+refuses to run — killing its own process — when the cached device width disagrees with the
+current display (`LauncherAppState` width conflict) or the current user is invalid.
+
+The companion state/gesture drivers to §5a live in `net.oneplus.launcher.uioverrides` (28
+classes): states `AllAppsState`, `BackgroundAppState`, `OverviewPeekState`, `OverviewState`,
+`QuickSwitchState`, and touch controllers `NavBarToHomeTouchController`,
+`FlingAndHoldTouchController`, `QuickSwitchTouchController`, `OverviewToAllAppsTouchController`,
+`TaskViewTouchController`, `StatusBarTouchController`, `PortraitStatesTouchController`,
+`LandscapeEdgeSwipeController`, `RecentsOperationController`. The `Workspace` surface itself
+is 16 classes — `Workspace`, `WorkspaceItemInfo`, `WorkspaceLayoutManager`,
+`WorkspaceStateTransitionAnimation`, `pageindicators.{WorkspacePageIndicator,OnePlusWorkspacePageIndicator,OnePlusWorkspacePageIndicatorTips}`,
+`graphics.WorkspaceAndHotseatScrim`, `model.{Add,Remove}WorkspaceItemsTask`,
+`touch.{WorkspaceTouchListener,WorkspaceOptionModeTouchHelper}`.
+
+**Home-screen layout evidence used by the reconstruction:**
+
+| Fact | Source (decoded resource) |
+|---|---|
+| Page 0 widgets: Google QSB 5×1 at (0,0); weather (3×1) and clock (3×1) both declared at (0,1) — regional variants | `res/xml/default_workspace_5x5_7.xml` |
+| Hotseat (`container=-101`): dialer (screen 0), messages (1), chrome (2), camera (3), gallery (4) | same |
+| Two folders (`google_folder_title`, `oneplus_folder_title`) on pages 0/1; Play Store pinned at (4,4) | same |
+| Icon size 56 dp, 14.4 sp labels, 5×5 at ≥694×406 dp ("Large Phone") | `res/xml/device_profiles.xml` |
+| `page_indicator_bottom_margin` 9 dp (6 dp fullscreen), `overview_mode_items_width` 84.57 dp | `res/values-sw400dp-xxhdpi/dimens.xml` (OnePlus-7-class width) |
+| Accent palette `accent_charm_purple` / `fashion_pink` / `golden` / `grass_green` / `lemon_yellow` / `sky_blue` / `vigour_red`, `accent_star_wars` `#ffff2837`, `launcher_bg_color` `#884e8391` | `res/values/colors.xml` |
+| `LauncherTheme`: transparent status + navigation bars, `windowDrawsSystemBarBackgrounds` | `res/values/styles.xml` |
+
+**Vendor metadata observed:** application class `net.oneplus.launcher.LauncherApplication`,
+`LauncherBackupAgent`, `@style/LauncherTheme` (transparent status and navigation bars),
+required `uses-feature com.oneplus.software.oos`, `oneplus_libs`
+`oplib.oneplus_sdk_wrapper:0.1.0;oplib.oneplus_sdk_utils:0.2.2`, `upgrade_product_code=40013`,
+Fabric/Crashlytics + Firebase + GMS analytics entries, and a Google Maps v2 API key
+(`com.google.android.maps.v2.API_KEY`) shipped in plaintext in the manifest.
+
+Per-device overrides live in `values-sw400dp-xxhdpi`, `values-sw370dp-xxhdpi`,
+`values-sw360dp-xxhdpi`, `values-sw360dp`, `values-sw340dp`; `values-2873x1440` is the
+1440p (7T Pro-class) variant. 117 locale folders are present, matching the `locales` list
+(§3).
+
+## 8. Reproduced artifact (Launcher Lab, pure Rust)
+
+This repository is the reconstruction: a Rust `cdylib` that `cargo-apk` packages into
+`dev.rajbhx.launcherlab`, exposing exactly one activity — `android.app.NativeActivity`, with
+`android:hasCode="false"` and `android.app.lib_name=launcher_lab`. That is the structural
+inverse of the analyzed package (DEX + resources, no native code): **no DEX at all**, and the
+only native code is the launcher itself.
+
+Built, aligned and signed locally with build-tools 34.0.0 / NDK 26.1.10909125 / JDK 21:
+
+| Field | Value |
+|---|---|
+| Output | `target/release/apk/launcher-lab.apk` |
+| Size | 2,962,238 bytes |
+| SHA-256 | `c091e2314d7b2b7f98d2bb8a5cf0641e18e802e472a31964c7c448e7804182a9` |
+| Entries | `AndroidManifest.xml`, `resources.arsc`, 5× `res/mipmap-*/ic_launcher.png`, `lib/arm64-v8a/liblauncher_lab.so` |
+| Native entry | AArch64 ELF exporting `ANativeActivity_onCreate` and `android_main` |
+| Signature | verified, `CN=Launcher Lab, OU=Demo, O=rajbhx, C=IN` |
+
+Reproduce with `pwsh -File scripts/build-apk.ps1`.
+
+Scope note: this is a faithful reconstruction of the *interaction model and home surface*
+(gesture consumers, Shelf card contract, Hidden Space, pager, recents) and not a
+reimplementation of the privileged platform integration — the analyzed launcher declares 56
+permissions including signature-or-system ones, and is a system HOME app on OxygenOS.
+Launcher Lab deliberately does not register as HOME replacement and requests only
+`ACCESS_WIFI_STATE` and `BLUETOOTH`.
+
+## 9. Limitations (provider-stated)
 
 - Static decompiler observations do not establish runtime behavior; the APK is never executed.
 - Display names may be JADX aliases; overload indices are engine-local; synthetic members included; source positions unknown.
