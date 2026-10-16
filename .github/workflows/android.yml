@@ -38,6 +38,31 @@ jobs:
           yes | "$SDKMANAGER" --licenses > /dev/null 2>&1 || true
           "$SDKMANAGER" --install "platform-tools" "platforms;android-34" "build-tools;33.0.2"
 
+      - name: Keep only build-tools 33.0.2
+        # cargo-apk selects the lexicographically-highest build-tools directory
+        # and needs the legacy `aapt` binary, which newer build-tools no longer
+        # ship. Remove the others so 33.0.2 is chosen deterministically.
+        run: |
+          set -e
+          for d in "$ANDROID_HOME"/build-tools/*/; do
+            ver=$(basename "$d")
+            if [ "$ver" != "33.0.2" ]; then
+              echo "removing build-tools $ver"
+              sudo rm -rf "$d"
+            fi
+          done
+          ls "$ANDROID_HOME/build-tools"
+
+      - name: Materialize release keystore
+        # Stable signing key (same across builds) stored as repo secrets.
+        env:
+          KEYSTORE_B64: ${{ secrets.LAUNCHER_LAB_KEYSTORE_BASE64 }}
+        run: |
+          set -e
+          test -n "$KEYSTORE_B64"
+          echo "$KEYSTORE_B64" | base64 -d > "$RUNNER_TEMP/launcher-lab-release.keystore"
+          ls -la "$RUNNER_TEMP/launcher-lab-release.keystore"
+
       - name: Set up NDK r26d
         id: ndk
         uses: nttld/setup-ndk@v1
@@ -61,6 +86,8 @@ jobs:
         env:
           ANDROID_NDK_HOME: ${{ steps.ndk.outputs.ndk-path }}
           ANDROID_NDK_ROOT: ${{ steps.ndk.outputs.ndk-path }}
+          CARGO_APK_RELEASE_KEYSTORE: ${{ runner.temp }}/launcher-lab-release.keystore
+          CARGO_APK_RELEASE_KEYSTORE_PASSWORD: ${{ secrets.LAUNCHER_LAB_KEYSTORE_PASSWORD }}
         run: cargo apk build --release
 
       - name: Locate and verify APK

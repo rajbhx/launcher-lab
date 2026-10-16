@@ -47,11 +47,6 @@ pub fn with_alpha(c: Color32, a: f32) -> Color32 {
     Color32::from_rgba_unmultiplied(c.r(), c.g(), c.b(), (a.clamp(0.0, 1.0) * 255.0) as u8)
 }
 
-/// Linear interpolation for `t` in `0..=1`.
-pub fn lerp(a: f32, b: f32, t: f32) -> f32 {
-    a + (b - a) * t.clamp(0.0, 1.0)
-}
-
 /// Frame-rate independent exponential approach towards `target`.
 pub fn approach(cur: f32, target: f32, dt: f32, speed: f32) -> f32 {
     cur + (target - cur) * (1.0 - (-(speed * dt)).exp())
