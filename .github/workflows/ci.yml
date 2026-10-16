@@ -12,9 +12,11 @@ env:
 jobs:
   test:
     name: Build + unit tests (host)
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: the `ubuntu-latest` label migrates to Ubuntu 26 on
+    # 2026-10-19; pinning keeps builds on a known-good image.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install system deps needed by eframe/winit on Linux
         run: |

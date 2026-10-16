@@ -113,7 +113,7 @@ animations keep transitions smooth.
 Two workflows, zero local builds:
 
 * **`.github/workflows/ci.yml`** — `cargo check --all-targets` + `cargo test` on
-  `ubuntu-latest` for every push: model tests and host compilation.
+  `ubuntu-24.04` for every push: model tests and host compilation.
 * **`.github/workflows/android.yml`** — the APK pipeline:
   1. JDK 17, Android SDK (platform 34, build-tools 33.0.2), NDK **r26d**
   2. Rust stable + `aarch64-linux-android` target, `cargo install cargo-apk`

@@ -8,7 +8,7 @@
 //! wallpaper, "^" caret + square dots above the dock.
 
 use eframe::egui::{
-    pos2, vec2, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke,
+    pos2, vec2, Align2, Color32, CornerRadius, FontId, Painter, Pos2, Rect, Stroke, StrokeKind,
 };
 
 use crate::app::LauncherLab;
@@ -279,7 +279,7 @@ fn draw_home(app: &LauncherLab, p: &Painter, rect: Rect, hits: &mut Vec<(Rect, H
             pos2(cx, caret_y - 4.0),
             pos2(cx + 8.0, caret_y + 4.0),
         ],
-        Stroke::new(2.2, theme::white(0.82)),
+        Stroke::new(2.2_f32, theme::white(0.82)),
     ));
     hits.push((
         Rect::from_center_size(pos2(cx, caret_y), vec2(48.0, 24.0)),
@@ -340,7 +340,7 @@ fn draw_search_pill(p: &Painter, pr: Rect, pal: &Palette, hits: &mut Vec<(Rect, 
 
     // Lens mark (very subtle in dark chrome).
     let lc = pill.center();
-    p.circle_stroke(lc, 7.5, Stroke::new(1.6, pal.lens));
+    p.circle_stroke(lc, 7.5, Stroke::new(1.6_f32, pal.lens));
     p.circle_filled(lc + vec2(2.6, 2.6), 2.2, pal.lens);
 
     // Multi-color mic.
@@ -578,7 +578,7 @@ fn draw_drawer(
             pos2(hx + 3.0, hy),
             pos2(hx - 3.0, hy + 5.0),
         ],
-        Stroke::new(2.0, theme::white(0.35)),
+        Stroke::new(2.0_f32, theme::white(0.35)),
     ));
     label(
         p,
@@ -722,7 +722,7 @@ fn draw_hidden(
             false,
         );
         let ring_c = pos2(rect.center().x, rect.top() + rect.height() * 0.60);
-        p.circle_stroke(ring_c, 26.0, Stroke::new(3.0, theme::white(0.18 * a)));
+        p.circle_stroke(ring_c, 26.0, Stroke::new(3.0_f32, theme::white(0.18 * a)));
         let prog = (app.unlock_hold / 0.65).clamp(0.0, 1.0);
         if prog > 0.001 {
             icons::arc(
@@ -1183,6 +1183,12 @@ fn draw_recents(
             theme::black(0.30 * fade * a),
         );
         icons::rrect(p, card, 16.0, theme::with_alpha(pal.card, fade));
+        p.rect_stroke(
+            card,
+            CornerRadius::same(16),
+            Stroke::new(1.0_f32, theme::with_alpha(pal.card_line, fade)),
+            StrokeKind::Inside,
+        );
 
         // Header above the card: icon + name, centered.
         let tw = p
@@ -1493,8 +1499,18 @@ fn draw_shade(
         Hit::ShadeBrightness,
     ));
 
+    // Hairline between the quick controls and the notification list.
+    bar(
+        p,
+        panel.left() + 12.0,
+        y0 + SHADE_BRIGHT_BOTTOM + 4.0,
+        panel.width() - 24.0,
+        1.0,
+        theme::with_alpha(pal.divider, a),
+    );
+
     // Notifications.
-    let mut ny = y0 + SHADE_BRIGHT_BOTTOM + 14.0;
+    let mut ny = y0 + SHADE_BRIGHT_BOTTOM + 26.0;
     label(
         p,
         pos2(gx, ny),

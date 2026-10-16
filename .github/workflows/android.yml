@@ -15,12 +15,14 @@ env:
 jobs:
   apk:
     name: Build installable APK (arm64-v8a)
-    runs-on: ubuntu-latest
+    # Pinned to 24.04: the `ubuntu-latest` label migrates to Ubuntu 26 on
+    # 2026-10-19; the runner-provided Android SDK layout is stable here.
+    runs-on: ubuntu-24.04
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Set up JDK 17 (for keytool / apksigner)
-        uses: actions/setup-java@v4
+        uses: actions/setup-java@v6
         with:
           distribution: temurin
           java-version: 17
@@ -104,7 +106,7 @@ jobs:
           sha256sum "$APK"
 
       - name: Upload APK as workflow artifact
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: launcher-lab-apk
           path: target/release/apk/launcher-lab.apk
@@ -112,7 +114,7 @@ jobs:
 
       - name: Publish rolling "apk-latest" release
         if: github.event_name == 'push'
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: apk-latest
           name: Launcher Lab - latest APK
