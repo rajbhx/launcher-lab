@@ -10,7 +10,8 @@ Launcher Lab reconstructs the interaction model that a static reverse-engineerin
 Space flag model, and the recents/Overview flow.
 
 > **Status:** demo. It is a real, installable launcher-shaped app — but tiles don't launch
-> other apps, the recents list is simulated, and the APK is debug-signed.
+> other apps, the recents list is simulated, and the APK is signed with a project key
+> (built and signed entirely by GitHub Actions).
 
 ## Download
 
@@ -94,7 +95,8 @@ targetSdk 34, `build_targets = ["aarch64-linux-android"]`, portrait, fullscreen 
 
 ## Limitations
 
-* Debug-signed, so Android shows the usual sideloading prompts and it can't be updated from Play.
+* Signed with a project-generated key (stable across builds, so in-place updates work), but
+  it is not a Play-ready signing setup.
 * Tiles, tasks and cards are demo data; nothing launches real apps (that would need the
   system's privileged recents/task APIs).
 * Only `arm64-v8a` is built — fine for the OnePlus 7, not for old 32-bit devices.

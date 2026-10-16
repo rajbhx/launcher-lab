@@ -97,16 +97,17 @@ jobs:
         run: |
           set -e
           find target -name "*.apk" -print
-          APK=$(find target -name "launcher-lab*.apk" | head -n 1)
-          test -n "$APK"
+          APK=target/release/apk/launcher-lab.apk
+          test -f "$APK"
           "$ANDROID_HOME/build-tools/33.0.2/aapt2" dump badging "$APK" | head -n 20
           "$ANDROID_HOME/build-tools/33.0.2/apksigner" verify --print-certs "$APK"
+          sha256sum "$APK"
 
       - name: Upload APK as workflow artifact
         uses: actions/upload-artifact@v4
         with:
           name: launcher-lab-apk
-          path: target/**/*.apk
+          path: target/release/apk/launcher-lab.apk
           if-no-files-found: error
 
       - name: Publish rolling "apk-latest" release
@@ -121,6 +122,6 @@ jobs:
             Automated build from `main` @ ${{ github.sha }}
 
             * target: OnePlus 7 (arm64-v8a, minSdk 29, targetSdk 34)
-            * debug-signed (installable via "install unknown apps")
+            * signed with the project release key (stable across builds)
             * packages the pure-Rust `cdylib` produced by cargo-apk
-          files: target/**/*.apk
+          files: target/release/apk/launcher-lab.apk
