@@ -262,6 +262,23 @@ fn with_env<T>(
     result
 }
 
+/// Raw `android.content.Context` handle from `ndk-context`, or `Unsupported`
+/// when running off-device.
+#[cfg(target_os = "android")]
+fn activity_context_raw() -> Result<*mut std::ffi::c_void, PlatformError> {
+    if !is_android() {
+        return Err(PlatformError::Unsupported);
+    }
+    Ok(ndk_context::android_context().context())
+}
+
+/// Raw `android.content.Context` handle from `ndk-context`, or `Unsupported`
+/// when running off-device.
+#[cfg(not(target_os = "android"))]
+fn activity_context_raw() -> Result<*mut std::ffi::c_void, PlatformError> {
+    Err(PlatformError::Unsupported)
+}
+
 /// Run `f` with both the JNI environment and the activity context object.
 ///
 /// The context handle is owned by `android-activity` (a global reference that
@@ -270,25 +287,15 @@ fn with_env<T>(
 fn with_activity_context<T>(
     f: impl FnOnce(&mut JNIEnv<'_>, &JObject<'_>) -> Result<T, PlatformError>,
 ) -> Result<T, PlatformError> {
-    #[cfg(target_os = "android")]
-    {
-        if !is_android() {
-            return Err(PlatformError::Unsupported);
-        }
-        let raw = ndk_context::android_context().context();
-        if raw.is_null() {
-            return Err(PlatformError::NotInitialized);
-        }
-        // SAFETY: ndk-context guarantees this global reference for the app's
-        // whole lifetime; we borrow it for one JNI call chain and never delete.
-        let activity = unsafe { JObject::from_raw(raw as jni::sys::jobject) };
-        with_env(|env| f(env, &activity))
+    let raw = activity_context_raw()?;
+    if raw.is_null() {
+        return Err(PlatformError::NotInitialized);
     }
-    #[cfg(not(target_os = "android"))]
-    {
-        let _ = f;
-        Err(PlatformError::Unsupported)
-    }
+    // SAFETY: on Android, ndk-context guarantees this global reference for the
+    // app's whole lifetime; we borrow it for one JNI call chain and never
+    // delete it. Off-device this function has already returned `Unsupported`.
+    let activity = unsafe { JObject::from_raw(raw as jni::sys::jobject) };
+    with_env(|env| f(env, &activity))
 }
 
 // ---------------------------------------------------------------------------
