@@ -992,7 +992,10 @@ fn draw_status(app: &LauncherLab, p: &Painter, rect: Rect) {
 
 fn draw_toast(p: &Painter, rect: Rect, msg: &str, ttl: f32, pal: &Palette) {
     let a = (ttl / 0.4).clamp(0.0, 1.0);
-    let galley = p.layout_no_wrap(msg.to_owned(), theme::font(13.0), Color32::WHITE);
+    // Wrap instead of clipping: real device messages ("...reading the system
+    // wallpaper...") are longer than a phone is wide.
+    let wrap = (rect.width() - 72.0).max(160.0);
+    let galley = p.layout(msg.to_owned(), theme::font(13.0), Color32::WHITE, wrap);
     let pill = Rect::from_center_size(
         pos2(rect.center().x, rect.bottom() - 96.0),
         galley.size() + vec2(36.0, 22.0),
@@ -1000,10 +1003,10 @@ fn draw_toast(p: &Painter, rect: Rect, msg: &str, ttl: f32, pal: &Palette) {
     icons::rrect(
         p,
         pill,
-        pill.height() * 0.5,
+        (pill.height() * 0.5).min(22.0),
         theme::with_alpha(pal.toast_bg, 0.94 * a),
     );
-    p.galley(pill.center() - galley.size() * 0.5, galley, Color32::WHITE);
+    p.galley(pill.min + vec2(18.0, 11.0), galley, Color32::WHITE);
 }
 
 // ------------------------------------------------------------------ locked

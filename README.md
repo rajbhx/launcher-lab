@@ -9,12 +9,13 @@ Launcher Lab reconstructs the interaction model that a static reverse-engineerin
 `*InputConsumer` gesture-routing state machine, the Shelf card/channel contract, the Hidden
 Space flag model, and the recents/Overview flow.
 
-> **Status:** v0.4.0 — real device integration. On Android every surface is backed by the
+> **Status:** v0.5.0 — real device integration. On Android every surface is backed by the
 > phone itself: the drawer lists the real installed apps, taps launch the real apps, icons and
 > the wallpaper stream in from the system, and the shade reads live toggle states (a normal
-> app cannot flip radios on Android 10+, so tiles open the real settings screens). The desktop
-> build keeps the bundled demo catalog. The APK is signed with a project key and built
-> entirely by GitHub Actions.
+> app cannot flip radios on Android 10+, so tiles open the real settings screens). Hidden apps
+> and the recents list are stored in the app's private data directory, so they survive an
+> Android-initiated process kill. The desktop build keeps the bundled demo catalog. The APK is
+> signed with a project key and built entirely by GitHub Actions.
 
 ## Download
 
@@ -89,7 +90,9 @@ Unit tests cover the pure model: gesture classification & release outcomes
 (`src/model/shelf.rs`), the hidden-space model including real hidden packages
 (`src/model/hidden.rs`), the UTC civil-date clock math (`src/clock.rs`), the
 app→component target map (`src/targets.rs`), the loader protocol (`src/loader.rs`),
-and platform value validation (`src/platform.rs`).
+platform value validation (`src/platform.rs`), and the persistent-state store — encode/decode
+round-trips, version rejection, malformed/duplicate row skipping and row caps
+(`src/store.rs`).
 
 ## Architecture
 
@@ -103,6 +106,7 @@ src/
 ├── icons.rs      app-icon painters (fallback for packages without a texture)
 ├── platform.rs   the JNI backend: installed apps, launching, icons, wallpaper, system state
 ├── loader.rs     single worker thread between platform (JNI) and the UI
+├── store.rs      persistent state (hidden apps, recents): validated line format, atomic write
 ├── targets.rs    reconstructed home/dock entries → real installed components
 ├── wallpaper.rs  procedural wallpaper (desktop + fallback while the real one loads)
 ├── clock.rs      wall-clock time (`localtime_r` on Android, UTC civil-date on host)
@@ -177,6 +181,11 @@ about them instead of faking them:
   tile states. Nothing else is collected, and no other permission is requested.
 * Signed with a project-generated key (stable across builds, so in-place updates work), but
   it is not a Play-ready signing setup.
+* **Wallpaper reads can fail** when the phone has a live wallpaper set — the system wallpaper
+  service intermittently refuses `getDrawable()`. The build retries a few times and then keeps
+  its painted fallback, saying so in a toast, rather than showing an empty screen.
+* Hidden apps and recents persist in the app's private data directory and are validated on
+  load; entries whose app was uninstalled are dropped instead of being kept as dead rows.
 * Only `arm64-v8a` is built — fine for the OnePlus 7, not for old 32-bit devices.
 * The launcher does not register as a HOME replacement on purpose (safe to try).
 

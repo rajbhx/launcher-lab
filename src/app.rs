@@ -46,6 +46,7 @@ use crate::model::pager::Pager;
 use crate::model::shelf::{CardManager, DeleteCardResult};
 use crate::model::state::{self, ConsumerType, GestureOrigin, ReleaseOutcome, Screen, Zones};
 use crate::platform::{self, ImageRgba, PlatformError, RealApp, SystemState};
+use crate::store;
 use crate::targets;
 use crate::theme;
 use crate::views::{self, Hit};
@@ -230,7 +231,7 @@ pub struct LauncherLab {
     /// How many times the system wallpaper has been requested (device only).
     wallpaper_attempts: u32,
     /// Time of the last wallpaper request, for the retry backoff.
-    wallpaper_attempt_t: f32,
+    wallpaper_attempt_t: f64,
     loader: Option<Loader>,
     /// Real apps hidden from the drawer.
     pub hidden_real: Vec<HiddenReal>,
@@ -370,6 +371,34 @@ impl LauncherLab {
 
         let loader = if android { Loader::spawn() } else { None };
 
+        // Restore what survived the previous process: the hidden apps and the
+        // recents list (both hold real packages on a device).
+        let mut hidden_real: Vec<HiddenReal> = Vec::new();
+        let mut state_error: Option<String> = None;
+        if android {
+            match store::load() {
+                Ok(state) => {
+                    hidden_real = state.hidden;
+                    for recent in state.recents {
+                        tasks.push(Task {
+                            mock: targets::app_for_package(&recent.package),
+                            package: Some(recent.package),
+                            activity: Some(recent.activity),
+                            title: recent.label,
+                            caption: "Recents".to_owned(),
+                            accent: recent.accent,
+                            resume_t: 1.0,
+                            dismiss_t: 0.0,
+                            dying: false,
+                            x_off: 0.0,
+                        });
+                    }
+                    tasks.truncate(store::MAX_RECENTS);
+                }
+                Err(message) => state_error = Some(message),
+            }
+        }
+
         let mut lab = Self {
             screen: Screen::Home,
             pager: Pager::new(5),
@@ -402,7 +431,7 @@ impl LauncherLab {
             wallpaper_attempts: 0,
             wallpaper_attempt_t: 0.0,
             loader,
-            hidden_real: Vec::new(),
+            hidden_real,
             search_letter: None,
             search_open: false,
             system: SystemState::default(),
@@ -431,6 +460,9 @@ impl LauncherLab {
 
         if android {
             lab.refresh_states_if_device();
+            if let Some(message) = state_error {
+                lab.toast(message);
+            }
             lab.toast("Loading installed apps\u{2026}");
             lab.request_apps();
         } else {
@@ -721,8 +753,37 @@ impl LauncherLab {
                 );
                 self.tasks.truncate(8);
                 self.carousel = 0;
+                self.persist_state();
             }
             Err(error) => self.toast(error.user_message()),
+        }
+    }
+
+    // ------------------------------------------------------- saved state
+
+    /// Write the device state (hidden apps + recents) so it survives a process
+    /// restart. Inert on the desktop build.
+    fn persist_state(&mut self) {
+        if !platform::is_android() {
+            return;
+        }
+        let state = store::State {
+            hidden: self.hidden_real.clone(),
+            recents: self
+                .tasks
+                .iter()
+                .filter_map(|task| {
+                    Some(store::RecentApp {
+                        package: task.package.clone()?,
+                        activity: task.activity.clone()?,
+                        label: task.title.clone(),
+                        accent: task.accent,
+                    })
+                })
+                .collect(),
+        };
+        if let Err(message) = store::save(&state) {
+            self.toast(message);
         }
     }
 
@@ -864,6 +925,7 @@ impl LauncherLab {
                                 activity,
                                 label,
                             });
+                            self.persist_state();
                         }
                     }
                 }
@@ -877,6 +939,7 @@ impl LauncherLab {
                 HiddenEntry::Real(real) => {
                     self.hidden_real.retain(|x| x.package != real.package);
                     self.toast(format!("Restored {} to the drawer", real.label));
+                    self.persist_state();
                 }
                 HiddenEntry::Demo(item) => {
                     self.hidden.unhide_item(&item.name);
@@ -1742,6 +1805,32 @@ impl LauncherLab {
                     self.resolved_targets = targets::resolve_all(&apps);
                     self.drawer_state = DrawerState::Ready;
 
+                    // Keep the hidden list honest against the live package
+                    // list: refresh the label/activity from the device and drop
+                    // entries whose app was uninstalled or lost its launcher
+                    // activity, so a restored file can never point at a
+                    // component that no longer exists.
+                    let mut changed = false;
+                    {
+                        let drawer = &self.drawer;
+                        let before = self.hidden_real.len();
+                        self.hidden_real
+                            .retain(|hidden| drawer.iter().any(|row| row.package == hidden.package));
+                        changed = before != self.hidden_real.len();
+                        for hidden in &mut self.hidden_real {
+                            if let Some(row) = drawer.iter().find(|row| row.package == hidden.package) {
+                                if hidden.activity != row.activity || hidden.label != row.label {
+                                    hidden.activity = row.activity.clone();
+                                    hidden.label = row.label.clone();
+                                    changed = true;
+                                }
+                            }
+                        }
+                    }
+                    if changed {
+                        self.persist_state();
+                    }
+
                     // Queue icons for everything that can be drawn: the whole
                     // drawer, the resolved home/dock entries and hidden apps.
                     let mut packages: Vec<String> = self
@@ -1801,22 +1890,40 @@ impl LauncherLab {
                 }
                 Reply::Wallpaper(Err(error)) => {
                     log::warn!("wallpaper load failed: {error}");
-                    self.toast(error.user_message());
+                    // Only speak up once the retries are spent: a live
+                    // wallpaper is briefly unreadable, and the painted
+                    // fallback is already on screen meanwhile.
+                    if self.wallpaper_attempts >= WALLPAPER_MAX_ATTEMPTS {
+                        self.toast(error.user_message());
+                    }
                 }
             }
         }
     }
 
     /// Fetch the real wallpaper once the window size is known (device only).
+    /// A failed read is retried a few times — a live wallpaper can be briefly
+    /// unavailable — before the painted fallback stays in place.
     fn maybe_request_wallpaper(&mut self, ctx: &Context) {
-        if !platform::is_android() || self.wallpaper_requested || self.loader.is_none() {
+        if !platform::is_android()
+            || self.wallpaper_attempts >= WALLPAPER_MAX_ATTEMPTS
+            || self.loader.is_none()
+        {
             return;
         }
-        self.wallpaper_requested = true;
+        if self.wallpaper_attempts > 0
+            && self.now - self.wallpaper_attempt_t < WALLPAPER_RETRY_SECONDS
+        {
+            return;
+        }
+        self.wallpaper_attempts += 1;
+        self.wallpaper_attempt_t = self.now;
         let pixels_per_point = ctx.pixels_per_point();
         let size = ctx.screen_rect().size();
-        let width = (size.x * pixels_per_point * 1.2).round() as u32;
-        let height = (size.y * pixels_per_point).round() as u32;
+        // 20% horizontal overscan for the pager parallax, capped so the
+        // decoded bitmap (4 bytes per pixel) can never grow without limit.
+        let width = ((size.x * pixels_per_point * 1.2).round() as u32).min(WALLPAPER_MAX_WIDTH);
+        let height = ((size.y * pixels_per_point).round() as u32).min(WALLPAPER_MAX_HEIGHT);
         let outcome = match &self.loader {
             Some(loader) => Some(loader.request(Request::Wallpaper { width, height })),
             None => None,
