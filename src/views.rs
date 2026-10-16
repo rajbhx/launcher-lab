@@ -1480,7 +1480,7 @@ fn draw_shade(
     let fx = sl.left() + sl.width() * f;
     icons::rrect(
         p,
-        Rect::from_min_max(sl.min, pos2(fx, sl.max)),
+        Rect::from_min_max(sl.min, pos2(fx, sl.max.y)),
         6.0,
         theme::with_alpha(pal.accent, 0.9 * a),
     );
@@ -1931,7 +1931,7 @@ fn music_mock(p: &Painter, c: Rect, accent: Color32, hits: &mut Vec<(Rect, Hit)>
     icons::rrect(p, seek, 2.5, theme::white(0.15));
     icons::rrect(
         p,
-        Rect::from_min_max(seek.min, pos2(seek.left() + seek.width() * 0.35, seek.max)),
+        Rect::from_min_max(seek.min, pos2(seek.left() + seek.width() * 0.35, seek.max.y)),
         2.5,
         theme::with_alpha(accent, 0.95),
     );

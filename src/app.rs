@@ -636,6 +636,7 @@ impl LauncherLab {
                 }
                 _ => {}
             },
+            Screen::Shade => {}
         }
     }
 
@@ -849,6 +850,7 @@ impl LauncherLab {
                 _ => {}
             },
             Screen::Hidden => {}
+            Screen::Shade => {}
         }
     }
 
@@ -934,11 +936,11 @@ impl LauncherLab {
                 }
             }
             Some((hr, Hit::Task(i))) => {
-                let src = Rect::from_center_size(hr.center(), vec2(96.0, 96.0));
+                let src = Rect::from_center_size(hr.center(), Vec2::splat(96.0));
                 self.resume(i, src);
             }
             Some((hr, Hit::TaskIcon(i))) => {
-                let src = Rect::from_center_size(hr.center(), vec2(96.0, 96.0));
+                let src = Rect::from_center_size(hr.center(), Vec2::splat(96.0));
                 self.resume(i, src);
             }
             Some((_, Hit::TaskClearAll)) => {
